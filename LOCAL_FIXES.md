@@ -21,6 +21,15 @@ compile/config-ergonomics ones that need no hardware.
    component schema option (`positive_time_period_milliseconds`, default `120s`) wired through
    codegen to a `set_auto_stop_inactivity_ms()` setter.
 
+4. **Custom "Neo" wake word model** — added `home-assistant-voice-pe/wake_words/neo.{tflite,json}`,
+   a microWakeWord v2 int8 streaming model trained 2026-07-10 for the single word **"Neo"**
+   (7,480 piper-TTS positives + microWakeWord negative sets). `wake_word_model` now defaults to
+   `wake_words/neo.json`, and the `hey_jarvis`/`hey_mycroft` extra triggers are commented out so
+   the device wakes only to "Neo". Quality (quantized streaming): at cutoff 0.98 ≈ 92% detection /
+   ~0.45 false-accepts per hour. **Not yet hardware-validated** — trained on synthetic audio; expect
+   a tune/retrain pass after a real flash-test, and bump `tensor_arena_size` if ESPHome errors.
+   To revert to a stock trigger, set `wake_word_model: okay_nabu`.
+
 ## Known TODO (out of scope here — need hardware / deeper work)
 
 - **Upstream WebSocket reconnect / backoff** — reconnect logic to the OpenAI Realtime relay is

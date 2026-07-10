@@ -41,11 +41,14 @@ substitutions:
   # Sound file for wake word (local file)
   wake_word_triggered_sound_file: wake_sound.flac
   # Primary wake word model. Change this in one place to swap the wake word.
-  # Accepted values are microWakeWord v2 model names (bare name = shorthand for
-  # github://esphome/micro-wake-word-models/models/v2/<name>.json), including:
-  #   okay_nabu, hey_jarvis, hey_mycroft, hey_rhasspy
-  # See https://github.com/esphome/micro-wake-word-models/tree/main/models/v2
-  wake_word_model: okay_nabu
+  # Accepts either:
+  #   - a microWakeWord v2 shorthand name (okay_nabu, hey_jarvis, hey_mycroft, hey_rhasspy)
+  #     = github://esphome/micro-wake-word-models/models/v2/<name>.json
+  #   - a local path to a custom manifest (relative to this yaml), or a github:// URL.
+  # Custom "Neo" model (trained 2026-07-10, int8 streaming). To fall back to a stock
+  # trigger, set this to `okay_nabu`. github URL alt:
+  #   github://magic9418/ha-openai-realtime/home-assistant-voice-pe/wake_words/neo.json@local-fixes
+  wake_word_model: wake_words/neo.json
 
 esphome:
   name: ha-voice-openai
@@ -1032,15 +1035,16 @@ micro_wake_word:
     gain_factor: 4
   stop_after_detection: false
   models:
-    # Primary wake word — driven by the ${wake_word_model} substitution above.
-    # microWakeWord v2 github shorthand; ESPHome 2025.11 resolves this to
-    # github://esphome/micro-wake-word-models/models/v2/<name>.json
+    # Primary wake word — driven by the ${wake_word_model} substitution above
+    # (now the custom "Neo" model). Only this one is active so the assistant
+    # wakes to "Neo" and nothing else, matching the Neo persona.
     - model: ${wake_word_model}
       id: primary_wake_word
-    - model: hey_jarvis
-      id: hey_jarvis
-    - model: hey_mycroft
-      id: hey_mycroft
+    # Extra triggers disabled for the Neo build — uncomment to also wake on these:
+    # - model: hey_jarvis
+    #   id: hey_jarvis
+    # - model: hey_mycroft
+    #   id: hey_mycroft
   vad:
   on_wake_word_detected:
     - if:
