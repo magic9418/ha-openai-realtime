@@ -1061,24 +1061,23 @@ micro_wake_word:
                     priority: true
                     sound_file: !lambda 'return id(wake_word_triggered_sound);'
                 - delay: 300ms
-          # Handle wake word based on bot speaking state
+          # Handle wake word based on session/bot state. A re-wake means "I have
+          # another request" — it must NEVER disconnect the session.
           - if:
               condition:
                 voice_assistant_websocket.is_running:
                   id: voice_assistant_ws
               then:
-                # Voice assistant is running - check if bot is speaking
+                # Already in a session. If the bot is mid-reply, "Neo" interrupts so
+                # you can ask something else right away. If it's just listening, do
+                # nothing — the wake chirp already acknowledged; keep the session open
+                # and just talk. (No stop-on-re-wake; end via the button or auto-stop.)
                 - if:
                     condition:
                       voice_assistant_websocket.is_bot_speaking:
                         id: voice_assistant_ws
                     then:
-                      # Bot is speaking - interrupt instead of disconnect
                       - voice_assistant_websocket.interrupt:
-                          id: voice_assistant_ws
-                    else:
-                      # Bot not speaking - stop voice assistant (disconnect)
-                      - voice_assistant_websocket.stop:
                           id: voice_assistant_ws
               else:
                 # Voice assistant not running - start it
