@@ -32,11 +32,14 @@ compile/config-ergonomics ones that need no hardware.
 
 ## Known TODO (out of scope here — need hardware / deeper work)
 
-- **Upstream WebSocket reconnect / backoff** — reconnect logic to the OpenAI Realtime relay is
-  fragile; needs proper exponential backoff + jitter.
-- **Satellite reconnect on server restart** — the ESP32 satellite does not reliably re-establish
-  its session when the add-on/relay server restarts.
-- **micro_wake_word re-arm after auto-stop** — wake word detection does not always re-arm after
-  an auto-stop, leaving the device unresponsive until reboot.
-- **Context restore on reconnect** — conversation context is lost across a reconnect; should be
-  restored so a dropped session resumes gracefully.
+- **WebSocket drop / server-restart recovery** — ✅ FIXED (5). Reworked for the session-server
+  architecture: instead of a fragile reconnect-and-resume, any unexpected drop or connect error
+  now cleanly returns the device to IDLE so the wake word re-arms ("Neo" is the retry). Disabled
+  the ESP-IDF client's built-in auto-reconnect (it fought this and left the device "connecting");
+  route DISCONNECTED/ERROR through the loop's `pending_disconnect_ → IDLE` path. This covers both
+  the old "upstream reconnect/backoff" and "reconnect on server restart" items: sessions are short
+  and stateless (a fresh OpenAI session per wake), so resume has no benefit; never-stuck does.
+- **micro_wake_word re-arm after auto-stop** — resolved in practice; wake-from-red works reliably
+  after the `on_wake_word_detected` rework + on_disconnected re-arm.
+- **Context restore on reconnect** — N/A under the session-server model (one stateless session per
+  wake). Revisit only if long-lived sessions are added.

@@ -256,7 +256,11 @@ void VoiceAssistantWebSocket::connect_websocket_() {
   websocket_cfg.task_stack = 8192;
   websocket_cfg.transport = WEBSOCKET_TRANSPORT_OVER_TCP;  // Use TCP (not SSL) for ws://
   websocket_cfg.network_timeout_ms = 30000;  // 30 second timeout for network operations
-  websocket_cfg.reconnect_timeout_ms = 10000;  // 10 second reconnect timeout
+  websocket_cfg.reconnect_timeout_ms = 10000;  // (unused: auto-reconnect disabled below)
+  // We handle recovery ourselves: any unexpected drop cleanly returns the device to IDLE
+  // (wake word re-arms; "Neo" is the retry). Sessions are short + stateless, so the ESP-IDF
+  // client's built-in auto-reconnect just fights that and leaves the device "connecting".
+  websocket_cfg.disable_auto_reconnect = true;
   websocket_cfg.ping_interval_sec = 20;  // Send ping every 20 seconds (matches server)
   websocket_cfg.pingpong_timeout_sec = 10;  // 10 second timeout for pong (matches server)
   
@@ -596,21 +600,16 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
         this->state_callback_(this->state_);
       }
       
-      // Trigger disconnected automation
+      // Trigger disconnected automation (re-arms micro_wake_word via on_disconnected).
       this->disconnected_trigger_.trigger();
-      
-      // Only attempt reconnection if we didn't receive an explicit disconnect message
-      // If explicit_disconnect_ is true, we should stay in idle mode
-      if (!this->explicit_disconnect_ && 
-          (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING || 
-           this->state_ == VOICE_ASSISTANT_WEBSOCKET_DISCONNECTED)) {
-        this->reconnect_pending_ = true;
-        this->last_reconnect_attempt_ = millis();
-      } else if (this->explicit_disconnect_) {
-        ESP_LOGI(TAG, "Explicit disconnect received, staying in idle mode (no reconnection)");
-        // Reset flag for next time
-        this->explicit_disconnect_ = false;
-      }
+
+      // Any drop — server restart, network blip, or our own stop() — cleanly returns to
+      // IDLE via loop() so the wake word works again. No auto-reconnect: sessions are short
+      // and stateless, so "Neo" is the retry. (This can't be done from the WS task; the
+      // loop's pending_disconnect_ handler destroys the client and sets IDLE.)
+      this->explicit_disconnect_ = false;
+      this->reconnect_pending_ = false;
+      this->pending_disconnect_ = true;
       break;
       
     case WEBSOCKET_EVENT_DATA:
@@ -699,10 +698,11 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       
       // Trigger error automation
       this->error_trigger_.trigger();
-      
-      // Attempt reconnection
-      this->reconnect_pending_ = true;
-      this->last_reconnect_attempt_ = millis();
+
+      // Connect/transport error (e.g. server down when you said "Neo") → clean up + IDLE
+      // so the device is immediately ready to try again on the next wake, not stuck.
+      this->reconnect_pending_ = false;
+      this->pending_disconnect_ = true;
       break;
       
     default:
