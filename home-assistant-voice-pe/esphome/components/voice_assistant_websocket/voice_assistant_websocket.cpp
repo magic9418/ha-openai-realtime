@@ -113,9 +113,9 @@ void VoiceAssistantWebSocket::loop() {
     if (this->last_speaker_audio_time_ > 0) {
       // Stop if speaker hasn't spoken for 5 seconds
       // If user speaks during this time, OpenAI will generate new audio, resetting the timer
-      if (time_since_speaker_audio > AUTO_STOP_INACTIVITY_MS) {
-        ESP_LOGI(TAG, "Auto-stopping: Speaker inactive for %u ms (threshold: %u ms)", 
-                 time_since_speaker_audio, AUTO_STOP_INACTIVITY_MS);
+      if (time_since_speaker_audio > this->auto_stop_inactivity_ms_) {
+        ESP_LOGI(TAG, "Auto-stopping: Speaker inactive for %u ms (threshold: %u ms)",
+                 time_since_speaker_audio, this->auto_stop_inactivity_ms_);
         this->stop();
       }
     }

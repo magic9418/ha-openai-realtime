@@ -36,6 +36,9 @@ class VoiceAssistantWebSocket : public Component {
   void set_server_url(const std::string &url) { this->server_url_ = url; }
   void set_microphone(microphone::Microphone *mic) { this->microphone_ = mic; }
   void set_speaker(speaker::Speaker *spkr) { this->speaker_ = spkr; }
+  // Auto-stop the session after this many ms of speaker (bot) inactivity.
+  // Configurable via the `auto_stop_inactivity_ms` component option (see __init__.py).
+  void set_auto_stop_inactivity_ms(uint32_t ms) { this->auto_stop_inactivity_ms_ = ms; }
   
   void start();
   void stop();
@@ -106,7 +109,9 @@ class VoiceAssistantWebSocket : public Component {
   
   // Auto-stop tracking
   uint32_t last_speaker_audio_time_{0};  // Last time we received audio from speaker
-  static const uint32_t AUTO_STOP_INACTIVITY_MS = 20000;  // Stop after 20 seconds of speaker inactivity
+  // Stop after N ms of speaker (bot) inactivity. Configurable via the
+  // `auto_stop_inactivity_ms` YAML option; default set here matches the schema default.
+  uint32_t auto_stop_inactivity_ms_{120000};
   
   // Audio conversion buffers
   std::vector<int16_t> mono_buffer_;  // For stereo to mono conversion (input)

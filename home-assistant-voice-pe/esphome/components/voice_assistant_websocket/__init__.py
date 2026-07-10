@@ -21,6 +21,7 @@ CONF_ON_CONNECTED = "on_connected"
 CONF_ON_DISCONNECTED = "on_disconnected"
 CONF_ON_ERROR = "on_error"
 CONF_ON_STOPPED = "on_stopped"
+CONF_AUTO_STOP_INACTIVITY_MS = "auto_stop_inactivity_ms"
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -28,6 +29,11 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_SERVER_URL): cv.string,
         cv.Optional(CONF_MICROPHONE): cv.use_id(microphone.Microphone),
         cv.Optional(CONF_SPEAKER): cv.use_id(speaker.Speaker),
+        # Auto-stop the session after this long with no speaker (bot) audio.
+        # Accepts a time period (e.g. "120s") or a raw millisecond integer.
+        cv.Optional(
+            CONF_AUTO_STOP_INACTIVITY_MS, default="120s"
+        ): cv.positive_time_period_milliseconds,
         cv.Optional(CONF_ON_CONNECTED): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_DISCONNECTED): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_ERROR): automation.validate_automation(single=True),
@@ -53,7 +59,12 @@ async def to_code(config):
         )
     
     cg.add(var.set_server_url(config[CONF_SERVER_URL]))
-    
+    cg.add(
+        var.set_auto_stop_inactivity_ms(
+            config[CONF_AUTO_STOP_INACTIVITY_MS].total_milliseconds
+        )
+    )
+
     if CONF_MICROPHONE in config:
         mic = await cg.get_variable(config[CONF_MICROPHONE])
         cg.add(var.set_microphone(mic))
