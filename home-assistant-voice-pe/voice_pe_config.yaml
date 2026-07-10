@@ -1086,20 +1086,14 @@ micro_wake_word:
 
 # External Components - Custom voice_assistant_websocket component
 external_components:
-  # Custom Voice Assistant WebSocket Component — pulled straight from the fork so no
-  # local files are needed in /config/esphome (was `type: local, path: esphome/components`).
+  # Custom Voice Assistant WebSocket Component — local, since we build from the full
+  # fork checkout (esphome/components/ sits right next to this yaml). No token needed.
+  # (For building on HA where only the yaml is copied, use a git source instead — see
+  # OPTION_2 / git history for the token-based variant.)
   - source:
-      type: git
-      url: https://github.com/magic9418/ha-openai-realtime
-      ref: local-fixes
-      path: home-assistant-voice-pe/esphome/components
-      # Private fork → needs a GitHub token. Add github_username + github_token to
-      # secrets.yaml (token = a fine-grained PAT with read access to this repo).
-      # If you make the fork PUBLIC instead, delete these two lines.
-      username: !secret github_username
-      password: !secret github_token
+      type: local
+      path: esphome/components
     components: [voice_assistant_websocket]
-    refresh: 0s
   # Voice PE Hardware Components
   - source:
       type: git
