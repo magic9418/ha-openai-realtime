@@ -1115,10 +1115,12 @@ voice_assistant_websocket:
   # Server URL - uses secret from secrets.yaml
   server_url: !secret server_url
 
-  # Auto-stop the session after this long with no speaker (bot) audio.
-  # Was a hard-coded constant in the component; now a config option.
-  # Accepts a time period (e.g. "120s") or a raw ms integer. Default: 120s.
-  auto_stop_inactivity_ms: 120s
+  # Auto-stop the session after this long with no speaker (bot) audio. While the
+  # session is open the mic streams to the backend (billed audio + live listening),
+  # so keep this tight — re-wake with "Neo" for the next request. The old 120s was a
+  # band-aid for the wake-word re-arm bug (now fixed); 15s balances follow-up pauses
+  # vs. cost/privacy. Accepts a time period ("15s") or raw ms.
+  auto_stop_inactivity_ms: 15s
 
   # Audio input (microphone) - reference to I2S audio input
   microphone: i2s_mics
