@@ -46,8 +46,9 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     
-    # Add ESP-IDF components
-    if CORE.using_esp_idf:
+    # Add ESP-IDF components. `CORE.using_esp_idf` was removed in newer ESPHome
+    # (2026.x). Fall back to True since the Voice PE always builds with ESP-IDF.
+    if getattr(CORE, "using_esp_idf", True):
         # WebSocket client component
         # Note: esp_websocket_client is a subdirectory in esp-protocols
         # We need to add the entire repository and reference the component path
