@@ -40,6 +40,12 @@ substitutions:
   # Server URL is now defined in secrets.yaml as server_url
   # Sound file for wake word (local file)
   wake_word_triggered_sound_file: wake_sound.flac
+  # Primary wake word model. Change this in one place to swap the wake word.
+  # Accepted values are microWakeWord v2 model names (bare name = shorthand for
+  # github://esphome/micro-wake-word-models/models/v2/<name>.json), including:
+  #   okay_nabu, hey_jarvis, hey_mycroft, hey_rhasspy
+  # See https://github.com/esphome/micro-wake-word-models/tree/main/models/v2
+  wake_word_model: okay_nabu
 
 esphome:
   name: ha-voice-openai
@@ -1026,8 +1032,11 @@ micro_wake_word:
     gain_factor: 4
   stop_after_detection: false
   models:
-    - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
-      id: okay_nabu
+    # Primary wake word — driven by the ${wake_word_model} substitution above.
+    # microWakeWord v2 github shorthand; ESPHome 2025.11 resolves this to
+    # github://esphome/micro-wake-word-models/models/v2/<name>.json
+    - model: ${wake_word_model}
+      id: primary_wake_word
     - model: hey_jarvis
       id: hey_jarvis
     - model: hey_mycroft
@@ -1093,7 +1102,12 @@ voice_assistant_websocket:
   id: voice_assistant_ws
   # Server URL - uses secret from secrets.yaml
   server_url: !secret server_url
-  
+
+  # Auto-stop the session after this long with no speaker (bot) audio.
+  # Was a hard-coded constant in the component; now a config option.
+  # Accepts a time period (e.g. "120s") or a raw ms integer. Default: 120s.
+  auto_stop_inactivity_ms: 120s
+
   # Audio input (microphone) - reference to I2S audio input
   microphone: i2s_mics
   
