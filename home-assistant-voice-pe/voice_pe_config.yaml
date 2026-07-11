@@ -1203,8 +1203,54 @@ button:
     id: restart_button
     name: "Restart"
     entity_category: config
-    disabled_by_default: true
+    disabled_by_default: false   # exposed in HA so the PE can be rebooted without a power-cycle
     icon: "mdi:restart"
+
+# --- Wake-word reliability hardening (2026-07-10) ------------------------------
+# The on-device "neo" detector was degrading across session cycles: after enough
+# wake -> session -> auto-stop cycles the mic wasn't always handed cleanly back to
+# micro_wake_word, so detection got progressively worse until a manual power-cycle.
+# Two safety nets:
+#   1) A watchdog that re-arms mww whenever the device is idle+unmuted but mww isn't
+#      actually running (catches any missed re-arm at session-end).
+#   2) A nightly reboot at 04:00 (only when idle) so heap never fragments over days.
+interval:
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: "return !id(init_in_progress);"
+              - switch.is_off: master_mute_switch
+              - not:
+                  micro_wake_word.is_running:
+          then:
+            - logger.log:
+                format: "Wake-word watchdog: mww not running while idle+unmuted — re-arming"
+                level: WARN
+            - micro_wake_word.start:
+                id: mww
+
+time:
+  # HA supplies the clock (api is already connected) — no internet/SNTP needed.
+  - platform: homeassistant
+    id: ha_time
+    on_time:
+      # 04:00 local: reboot to clear heap, but only if no voice session is open.
+      - seconds: 0
+        minutes: 0
+        hours: 4
+        then:
+          - if:
+              condition:
+                not:
+                  voice_assistant_websocket.is_running:
+                    id: voice_assistant_ws
+              then:
+                - logger.log:
+                    format: "Nightly auto-reboot (04:00 idle) — clearing heap fragmentation"
+                    level: INFO
+                - button.press: restart_button
 
 debug:
   update_interval: 5s
