@@ -39,6 +39,9 @@ htmlcov/
 
 # Config (may contain secrets)
 config/mcp_servers.yaml
+# Voice PE real secrets (wifi/ota passwords, github token, server_url) — never commit
+secrets.yaml
+home-assistant-voice-pe/secrets.yaml
 
 # OS
 .DS_Store
