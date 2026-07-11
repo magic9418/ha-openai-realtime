@@ -21,6 +21,8 @@ CONF_ON_CONNECTED = "on_connected"
 CONF_ON_DISCONNECTED = "on_disconnected"
 CONF_ON_ERROR = "on_error"
 CONF_ON_STOPPED = "on_stopped"
+CONF_ON_ENROLL_START = "on_enroll_start"
+CONF_ON_ENROLL_STOP = "on_enroll_stop"
 CONF_AUTO_STOP_INACTIVITY_MS = "auto_stop_inactivity_ms"
 
 CONFIG_SCHEMA = cv.Schema(
@@ -38,6 +40,8 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_ON_DISCONNECTED): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_ERROR): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_STOPPED): automation.validate_automation(single=True),
+        cv.Optional(CONF_ON_ENROLL_START): automation.validate_automation(single=True),
+        cv.Optional(CONF_ON_ENROLL_STOP): automation.validate_automation(single=True),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -93,6 +97,16 @@ async def to_code(config):
     if CONF_ON_STOPPED in config:
         await automation.build_automation(
             var.get_stopped_trigger(), [], config[CONF_ON_STOPPED]
+        )
+
+    if CONF_ON_ENROLL_START in config:
+        await automation.build_automation(
+            var.get_enroll_start_trigger(), [], config[CONF_ON_ENROLL_START]
+        )
+
+    if CONF_ON_ENROLL_STOP in config:
+        await automation.build_automation(
+            var.get_enroll_stop_trigger(), [], config[CONF_ON_ENROLL_STOP]
         )
 
 
@@ -166,6 +180,36 @@ async def voice_assistant_websocket_interrupt_to_code(config, action_id, templat
     VOICE_ASSISTANT_WEBSOCKET_CONDITION_SCHEMA,
 )
 async def voice_assistant_websocket_is_bot_speaking_to_code(config, condition_id, template_arg, args):
+    paren = await cg.get_variable(config[CONF_ID])
+    return cg.new_Pvariable(condition_id, template_arg, paren)
+
+
+@automation.register_action(
+    "voice_assistant_websocket.false_flag",
+    voice_assistant_websocket_ns.class_("VoiceAssistantWebSocketFalseFlagAction"),
+    VOICE_ASSISTANT_WEBSOCKET_ACTION_SCHEMA,
+)
+async def voice_assistant_websocket_false_flag_to_code(config, action_id, template_arg, args):
+    paren = await cg.get_variable(config[CONF_ID])
+    return cg.new_Pvariable(action_id, template_arg, paren)
+
+
+@automation.register_action(
+    "voice_assistant_websocket.button_cancel",
+    voice_assistant_websocket_ns.class_("VoiceAssistantWebSocketButtonCancelAction"),
+    VOICE_ASSISTANT_WEBSOCKET_ACTION_SCHEMA,
+)
+async def voice_assistant_websocket_button_cancel_to_code(config, action_id, template_arg, args):
+    paren = await cg.get_variable(config[CONF_ID])
+    return cg.new_Pvariable(action_id, template_arg, paren)
+
+
+@automation.register_condition(
+    "voice_assistant_websocket.turn_has_no_reply_audio",
+    voice_assistant_websocket_ns.class_("VoiceAssistantWebSocketTurnHasNoReplyAudioCondition"),
+    VOICE_ASSISTANT_WEBSOCKET_CONDITION_SCHEMA,
+)
+async def voice_assistant_websocket_turn_has_no_reply_audio_to_code(config, condition_id, template_arg, args):
     paren = await cg.get_variable(config[CONF_ID])
     return cg.new_Pvariable(condition_id, template_arg, paren)
 

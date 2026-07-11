@@ -116,11 +116,24 @@ void VoiceAssistantWebSocket::loop() {
       if (time_since_speaker_audio > this->auto_stop_inactivity_ms_) {
         ESP_LOGI(TAG, "Auto-stopping: Speaker inactive for %u ms (threshold: %u ms)",
                  time_since_speaker_audio, this->auto_stop_inactivity_ms_);
+        // Timer/auto-stop close: drop any half-sentence still sitting in the server's
+        // input buffer *at the cut-off source* so a later wake can't "complete" it.
+        // Only on this timer path — NOT on user-interrupt or wake (per the guards plan;
+        // a reactive clear-on-wake disturbs the server VAD). Sent while still connected,
+        // before stop() tears the WS down.
+        this->send_text_frame_("{\"type\":\"mic_flush\"}");
         this->stop();
       }
     }
   }
   
+  // Enrollment safety cap: never leave the mic pinned open / wake disarmed indefinitely.
+  // (Normal exit is {"enroll","stop"} or a WS drop; this is the backstop.)
+  if (this->enrolling_ && (millis() - this->enroll_start_time_) > ENROLL_MAX_MS) {
+    ESP_LOGW(TAG, "Enrollment safety cap (%u ms) hit - exiting enrollment mode", ENROLL_MAX_MS);
+    this->exit_enrollment_();
+  }
+
   // Audio input is handled via callback (on_microphone_data_)
   // No need to poll here
   
@@ -466,8 +479,9 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
     return;
   }
   
-  // Block microphone audio if bot is currently speaking
-  if (this->is_bot_speaking()) {
+  // Block microphone audio if bot is currently speaking — EXCEPT during enrollment, where
+  // the mic is pinned open and must keep streaming reps even while the coach TTS plays.
+  if (this->is_bot_speaking() && !this->enrolling_) {
     return;  // Don't send microphone audio while bot is speaking
   }
   
@@ -528,18 +542,79 @@ bool VoiceAssistantWebSocket::is_bot_speaking() const {
   return time_since_last_audio < 500;  // 500ms threshold
 }
 
+void VoiceAssistantWebSocket::send_text_frame_(const char *json) {
+  // Shared JSON text-frame sender for all control messages (interrupt / wake / mic_flush /
+  // false_flag / button_cancel). No-op (with a warning) if the WS isn't connected.
+  if (!this->is_connected() || this->websocket_client_ == nullptr) {
+    ESP_LOGW(TAG, "Cannot send control frame '%s' - not connected", json);
+    return;
+  }
+  int sent = esp_websocket_client_send_text(this->websocket_client_, json, strlen(json), portMAX_DELAY);
+  if (sent < 0) {
+    ESP_LOGW(TAG, "Failed to send control frame: %s", json);
+  } else {
+    ESP_LOGI(TAG, "Sent control frame: %s", json);
+  }
+}
+
+void VoiceAssistantWebSocket::send_false_flag() {
+  // Button double-press → "that was a false trigger". Valid any time there's a live WS;
+  // the server relabels the newest wake probe as a hard negative for retraining.
+  ESP_LOGI(TAG, "false_flag: user marked the last wake as a false trigger");
+  this->send_text_frame_("{\"type\":\"false_flag\"}");
+}
+
+void VoiceAssistantWebSocket::send_button_cancel() {
+  // Fast single-press cancel shortly after a wake with no reply audio yet → treat as an
+  // unwanted wake. Gate here too (defense in depth) so a press during a real turn doesn't
+  // mislabel it; the YAML also checks turn_has_no_reply_audio before calling this.
+  if (!this->turn_has_no_reply_audio()) {
+    ESP_LOGD(TAG, "button_cancel ignored: turn already has reply audio (real turn)");
+    return;
+  }
+  ESP_LOGI(TAG, "button_cancel: fast cancel after wake with no reply audio yet");
+  this->send_text_frame_("{\"type\":\"button_cancel\"}");
+}
+
+void VoiceAssistantWebSocket::enter_enrollment_() {
+  if (this->enrolling_) {
+    ESP_LOGD(TAG, "Already enrolling");
+    return;
+  }
+  ESP_LOGI(TAG, "Entering enrollment mode: mic pinned open, wake/stop models disarmed");
+  this->enrolling_ = true;
+  this->enroll_start_time_ = millis();
+  // Make sure the mic is actually running so reps stream to the backend. The YAML
+  // enroll_start trigger disarms micro_wake_word so the reps don't self-trigger.
+  if (this->microphone_ != nullptr && this->microphone_->is_stopped()) {
+    this->microphone_->start();
+  }
+  this->enroll_start_trigger_.trigger();
+}
+
+void VoiceAssistantWebSocket::exit_enrollment_() {
+  if (!this->enrolling_) {
+    return;
+  }
+  ESP_LOGI(TAG, "Exiting enrollment mode: restoring normal wake/stop-model operation");
+  this->enrolling_ = false;
+  this->enroll_start_time_ = 0;
+  // The YAML enroll_stop trigger re-arms micro_wake_word.
+  this->enroll_stop_trigger_.trigger();
+}
+
 void VoiceAssistantWebSocket::interrupt() {
   if (!this->is_connected() || this->websocket_client_ == nullptr) {
     ESP_LOGW(TAG, "Cannot send interrupt - not connected");
     return;
   }
-  
+
   ESP_LOGI(TAG, "Sending interrupt message to server");
-  
+
   // Send interrupt message as JSON text frame
   const char *interrupt_msg = "{\"type\":\"interrupt\"}";
   int sent = esp_websocket_client_send_text(this->websocket_client_, interrupt_msg, strlen(interrupt_msg), portMAX_DELAY);
-  
+
   if (sent < 0) {
     ESP_LOGW(TAG, "Failed to send interrupt message");
   } else {
@@ -583,11 +658,19 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       this->reconnect_attempts_ = 0;
       this->reconnect_pending_ = false;
       this->last_audio_send_ = millis();
-      
+
+      // Wake boundary: a fresh session always begins with start() → connect → CONNECTED.
+      // Tell the server "a wake just happened" so it can arm the dangling-VAD guard and
+      // (flywheel) ring-buffer the opening audio as a probe. Sent here rather than in
+      // start() because that's the earliest point the WS can actually carry the frame.
+      // (A re-wake mid-session doesn't reconnect, so this is one wake per session — a
+      // known limitation noted in docs/wakeword_flywheel_plan.md.)
+      this->send_text_frame_("{\"type\":\"wake\"}");
+
       if (this->state_callback_) {
         this->state_callback_(this->state_);
       }
-      
+
       // Trigger connected automation
       this->connected_trigger_.trigger();
       break;
@@ -595,6 +678,9 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
     case WEBSOCKET_EVENT_DISCONNECTED:
       ESP_LOGW(TAG, "WebSocket disconnected");
       this->state_ = VOICE_ASSISTANT_WEBSOCKET_DISCONNECTED;
+
+      // Never leave the box stuck in enrollment if the session drops mid-coach.
+      this->exit_enrollment_();
       
       if (this->state_callback_) {
         this->state_callback_(this->state_);
@@ -633,6 +719,37 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
           this->explicit_disconnect_ = true;
           // Stop the voice assistant (will go to idle mode)
           this->stop();
+        } else if (message.find("\"type\":\"hello\"") != std::string::npos ||
+                   message.find("\"type\": \"hello\"") != std::string::npos) {
+          // Server → firmware config on WS open. Parse wake_open_delay_ms and store it so
+          // the (optional) server-driven chime->start delay lambda can read it back.
+          size_t key = message.find("wake_open_delay_ms");
+          if (key != std::string::npos) {
+            size_t colon = message.find(':', key);
+            if (colon != std::string::npos) {
+              // Skip whitespace after the colon, then parse the integer.
+              size_t p = colon + 1;
+              while (p < message.size() && (message[p] == ' ' || message[p] == '\t')) p++;
+              long val = strtol(message.c_str() + p, nullptr, 10);
+              if (val > 0) {
+                this->wake_open_delay_ms_ = static_cast<uint32_t>(val);
+                ESP_LOGI(TAG, "hello: wake_open_delay_ms = %u", this->wake_open_delay_ms_);
+              }
+            }
+          }
+        } else if (message.find("\"type\":\"enroll\"") != std::string::npos ||
+                   message.find("\"type\": \"enroll\"") != std::string::npos) {
+          // Enrollment mode enter/exit driven by the session-server EnrollmentConductor.
+          if (message.find("\"mode\":\"start\"") != std::string::npos ||
+              message.find("\"mode\": \"start\"") != std::string::npos) {
+            this->enter_enrollment_();
+          } else if (message.find("\"mode\":\"stop\"") != std::string::npos ||
+                     message.find("\"mode\": \"stop\"") != std::string::npos) {
+            this->exit_enrollment_();
+          } else {
+            ESP_LOGW(TAG, "enroll frame with no recognized mode: %.*s",
+                     event_data->data_len, event_data->data_ptr);
+          }
         }
       }
       break;
@@ -691,11 +808,14 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
         ESP_LOGE(TAG, "WebSocket error (no event data available)");
       }
       this->state_ = VOICE_ASSISTANT_WEBSOCKET_ERROR;
-      
+
+      // Never leave the box stuck in enrollment if the session errors mid-coach.
+      this->exit_enrollment_();
+
       if (this->state_callback_) {
         this->state_callback_(this->state_);
       }
-      
+
       // Trigger error automation
       this->error_trigger_.trigger();
 

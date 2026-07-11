@@ -40,6 +40,12 @@ substitutions:
   # Server URL is now defined in secrets.yaml as server_url
   # Sound file for wake word (local file)
   wake_word_triggered_sound_file: wake_sound.flac
+  # Chime->start-of-forwarding delay (echo guard): the wake chime's DAC tail plays out
+  # before mic frames are forwarded, so the chime never gets answered. 320ms matches the
+  # session-server audio_prime_ms neighborhood. Server can override this at runtime via the
+  # {"type":"hello","wake_open_delay_ms":N} frame — see the commented server-driven variant
+  # in micro_wake_word.on_wake_word_detected below (voice_assistant_websocket guards plan).
+  wake_open_delay_ms: 320ms
   # Primary wake word model. Change this in one place to swap the wake word.
   # Accepts either:
   #   - a microWakeWord v2 shorthand name (okay_nabu, hey_jarvis, hey_mycroft, hey_rhasspy)
@@ -252,6 +258,20 @@ binary_sensor:
                       voice_assistant_websocket.is_running:
                         id: voice_assistant_ws
                     then:
+                      # Fast single-press cancel shortly after a wake with NO reply audio yet
+                      # = the wake was unwanted. Flag it as a false trigger for retraining
+                      # before we tear the session down. (The condition self-gates, so a press
+                      # during a real turn just stops normally without mislabeling it.)
+                      - if:
+                          condition:
+                            voice_assistant_websocket.turn_has_no_reply_audio:
+                              id: voice_assistant_ws
+                          then:
+                            - logger.log:
+                                format: "Fast cancel with no reply audio - sending button_cancel"
+                                level: INFO
+                            - voice_assistant_websocket.button_cancel:
+                                id: voice_assistant_ws
                       - logger.log:
                           format: "Voice assistant is running - stopping"
                           level: INFO
@@ -292,6 +312,15 @@ binary_sensor:
                 - event.trigger:
                     id: button_press_event
                     event_type: "double_press"
+                # Wake-word flywheel: a double-press means "that was a false trigger".
+                # Only meaningful with a live session/WS; the action no-ops if not connected.
+                - if:
+                    condition:
+                      voice_assistant_websocket.is_connected:
+                        id: voice_assistant_ws
+                    then:
+                      - voice_assistant_websocket.false_flag:
+                          id: voice_assistant_ws
       # Triple Click
       - timing:
           - ON for at most 1s
@@ -1060,7 +1089,11 @@ micro_wake_word:
                     id: play_sound
                     priority: true
                     sound_file: !lambda 'return id(wake_word_triggered_sound);'
-                - delay: 300ms
+                # Echo guard: let the chime tail play out before mic frames are forwarded.
+                # Substitution default (${wake_open_delay_ms}, 320ms). To let the server own
+                # this knob (from the {"type":"hello"} frame), replace the line below with:
+                #   - delay: !lambda 'return id(voice_assistant_ws)->get_wake_open_delay_ms();'
+                - delay: ${wake_open_delay_ms}
           # Handle wake word based on session/bot state. A re-wake means "I have
           # another request" — it must NEVER disconnect the session.
           - if:
@@ -1164,6 +1197,21 @@ voice_assistant_websocket:
               id: media_mixing_input
               decibel_reduction: 0
               duration: 1.0s
+  # Wake-word enrollment mode (docs/wakeword_flywheel_plan.md Phase 3). The C++ owns the
+  # mic-pin + 15-min safety cap + WS-drop restore; the YAML just disarms/re-arms the wake
+  # model so guided reps ("Neo, Neo, Neo...") don't self-trigger while streaming.
+  on_enroll_start:
+    - logger.log:
+        format: "Enrollment start - stopping micro_wake_word so reps don't self-trigger"
+        level: INFO
+    - micro_wake_word.stop:
+        id: mww
+  on_enroll_stop:
+    - logger.log:
+        format: "Enrollment stop - re-arming micro_wake_word"
+        level: INFO
+    - micro_wake_word.start:
+        id: mww
 
 # Voice Kit Component - Voice PE Hardware (XMOS Firmware)
 # The XMOS XU316 chip has built-in audio processing support:
