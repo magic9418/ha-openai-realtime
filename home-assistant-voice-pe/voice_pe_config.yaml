@@ -1112,9 +1112,9 @@ voice_assistant_websocket:
   # Auto-stop the session after this long with no speaker (bot) audio. While the
   # session is open the mic streams to the backend (billed audio + live listening),
   # so keep this tight — re-wake with "Neo" for the next request. The old 120s was a
-  # band-aid for the wake-word re-arm bug (now fixed); 10s ≈ Alexa's snappy close —
-  # re-wake with "Neo" for follow-ups. Accepts a time period ("10s") or raw ms.
-  auto_stop_inactivity_ms: 10s
+  # band-aid for the wake-word re-arm bug (now fixed); 15s = a slightly roomier close
+  # than Alexa — re-wake with "Neo" for follow-ups. Accepts a time period ("15s") or raw ms.
+  auto_stop_inactivity_ms: 15s
 
   # Audio input (microphone) - reference to I2S audio input
   microphone: i2s_mics
