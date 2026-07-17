@@ -67,8 +67,16 @@ esphome:
       - script.execute: control_leds
       - delay: 1s
       - switch.turn_on: internal_speaker_amp
-      # init_in_progress will be set to false when API connects (see api.on_client_connected)
-      # micro_wake_word will be started when API connects (see api.on_client_connected)
+      # Start the wake word INDEPENDENT of Home Assistant. This device's voice loop runs over the
+      # session-server WebSocket, not HA — but micro_wake_word was only started by
+      # api.on_client_connected, so whenever the device wasn't adopted in HA the wake word was dead
+      # (no "Neo"). Start it here once voice_kit is up (~a few seconds after boot). The api handler
+      # below still (idempotently) starts it too, so an HA connection is a bonus, not a requirement.
+      - delay: 4s
+      - micro_wake_word.start:
+          id: mww
+      - lambda: id(init_in_progress) = false;
+      - script.execute: control_leds
 
 esp32:
   board: esp32-s3-devkitc-1
