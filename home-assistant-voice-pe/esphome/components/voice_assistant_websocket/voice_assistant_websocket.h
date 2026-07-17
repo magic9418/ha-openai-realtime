@@ -10,10 +10,20 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"   // heap_caps_malloc for the PSRAM audio ring buffer
 #endif
 #include <string>
 #include <vector>
 #include <queue>
+
+// Barge-in policy toggle (see on_microphone_data_):
+//   0 = DEFAULT half-duplex — mic muted while Neo speaks; barge-in is via the wake word ("Neo").
+//       Robust in noisy / multi-person rooms (no cross-talk phantom turns).
+//   1 = FULL-DUPLEX — stream mic continuously so you can talk over Neo to interrupt. Only for a
+//       quiet, single-person room (relies on XMOS AEC to reject Neo's own playback).
+#ifndef NEO_FULL_DUPLEX_BARGEIN
+#define NEO_FULL_DUPLEX_BARGEIN 0
+#endif
 
 namespace esphome {
 namespace voice_assistant_websocket {
@@ -118,11 +128,19 @@ class VoiceAssistantWebSocket : public Component {
   std::vector<uint8_t> input_buffer_;
   std::vector<uint8_t> output_buffer_;
   
-  // Queue for audio data when speaker buffer is full
-  // Reduced size to prevent memory exhaustion
-  std::queue<std::vector<uint8_t>> audio_queue_;
-  static const size_t MAX_QUEUE_SIZE = 10;  // Max 10 chunks (~40KB) to prevent memory overflow
-  static const size_t MIN_FREE_HEAP_BYTES = 15000;  // Minimum free heap required before queuing audio
+  // Assistant-audio backlog (audio arriving faster than the speaker drains it). Held in a fixed
+  // PSRAM RING BUFFER, not a std::queue<vector>: the old per-chunk vector queue alloc/free'd on the
+  // scarce ~300 KB internal DRAM, which fragmented it and OOM-crashed the PE on long playback
+  // (reading a whole book). Pre-allocated ONCE from the 8 MB PSRAM → no per-chunk allocation, no
+  // fragmentation, safe for unbounded-length reads. The server paces ~real-time, so fill stays low.
+  static const size_t AUDIO_RING_CAPACITY = 256 * 1024;  // ~10s @24kHz mono16 of jitter headroom
+  uint8_t *audio_ring_{nullptr};
+  size_t audio_ring_read_{0};   // read cursor
+  size_t audio_ring_fill_{0};   // bytes currently buffered
+  void audio_ring_init_();
+  void audio_ring_push_(const uint8_t *data, size_t len);
+  void audio_ring_drain_();
+  void audio_ring_clear_();
   
   // Timing
   uint32_t last_audio_send_{0};
@@ -154,7 +172,7 @@ class VoiceAssistantWebSocket : public Component {
   static const uint32_t RECONNECT_DELAY_MS = 5000;
   uint32_t last_reconnect_attempt_{0};
   uint32_t interrupt_time_{0};  // Time when interrupt was sent (to ignore audio for a short period)
-  static const uint32_t INTERRUPT_IGNORE_AUDIO_MS = 500;  // Ignore audio for 500ms after interrupt
+  static const uint32_t INTERRUPT_IGNORE_AUDIO_MS = 250;  // Ignore mic for 250ms after interrupt (was 500 — too long, ate the front of the user's command). Band-aid for echo; can go lower once AEC/AGC fix lands.
 
   // Wake-boundary / server-driven chime->start delay. Overwritten by the {"type":"hello",
   // "wake_open_delay_ms":N} frame the server sends on WS open; falls back to this default

@@ -23,6 +23,7 @@ void VoiceAssistantWebSocket::setup() {
   this->mono_buffer_.reserve(INPUT_BUFFER_SIZE / 2);  // Reserve for mono conversion (input)
   this->resampled_buffer_.reserve(INPUT_BUFFER_SIZE * 3 / 2); // 1.5x upsampling for 16kHz -> 24kHz
   this->output_stereo_buffer_.reserve(4096 * 2);  // Reserve for output processing (24kHz mono -> 48kHz stereo)
+  this->audio_ring_init_();  // pre-allocate the PSRAM audio backlog ring (see header)
   this->state_ = VOICE_ASSISTANT_WEBSOCKET_IDLE;
   
   // Register microphone data callback
@@ -58,26 +59,9 @@ void VoiceAssistantWebSocket::loop() {
     return;  // Skip other loop operations after disconnect
   }
   
-  // Try to process queued audio if speaker is running
-  if (this->speaker_ != nullptr && this->speaker_->is_running() && !this->audio_queue_.empty()) {
-    const std::vector<uint8_t> &queued_data = this->audio_queue_.front();
-    size_t queued_written = this->speaker_->play(queued_data.data(), queued_data.size());
-    
-    if (queued_written == queued_data.size()) {
-      // Successfully sent queued data
-      this->audio_queue_.pop();
-      ESP_LOGD(TAG, "Sent queued audio chunk from loop (%zu bytes)", queued_data.size());
-    } else if (queued_written > 0) {
-      // Partially sent - remove sent portion and keep remainder
-      if (queued_written < queued_data.size()) {
-        std::vector<uint8_t> remainder(queued_data.begin() + queued_written, queued_data.end());
-        this->audio_queue_.pop();
-        this->audio_queue_.push(remainder);
-      } else {
-        this->audio_queue_.pop();
-      }
-    }
-    // If queued_written == 0, buffer is still full, try again next loop
+  // Drain the assistant-audio backlog (PSRAM ring) into the speaker as it frees up.
+  if (this->speaker_ != nullptr && this->speaker_->is_running() && this->audio_ring_fill_ > 0) {
+    this->audio_ring_drain_();
   }
   
   // Handle pending start request
@@ -149,7 +133,7 @@ void VoiceAssistantWebSocket::dump_config() {
   ESP_LOGCONFIG(TAG, "  Output Sample Rate: %u Hz", OUTPUT_SAMPLE_RATE);
   ESP_LOGCONFIG(TAG, "  Microphone: %s", this->microphone_ ? "Yes" : "No");
   ESP_LOGCONFIG(TAG, "  Speaker: %s", this->speaker_ ? "Yes" : "No");
-  ESP_LOGCONFIG(TAG, "  Max Queue Size: %zu chunks", MAX_QUEUE_SIZE);
+  ESP_LOGCONFIG(TAG, "  Audio ring buffer: %zu bytes (PSRAM)", AUDIO_RING_CAPACITY);
 }
 
 void VoiceAssistantWebSocket::start() {
@@ -219,11 +203,9 @@ void VoiceAssistantWebSocket::stop() {
     this->speaker_->stop();
   }
   
-  // Clear audio queue
-  while (!this->audio_queue_.empty()) {
-    this->audio_queue_.pop();
-  }
-  
+  // Clear the audio backlog ring
+  this->audio_ring_clear_();
+
   if (this->state_callback_) {
     this->state_callback_(this->state_);
   }
@@ -390,101 +372,91 @@ void VoiceAssistantWebSocket::process_received_audio_(const uint8_t *data, size_
     this->speaker_->start();
   }
   
-  // Try to process queued audio first (if any)
-  while (!this->audio_queue_.empty()) {
-    const std::vector<uint8_t> &queued_data = this->audio_queue_.front();
-    size_t queued_written = this->speaker_->play(queued_data.data(), queued_data.size());
-    
-    if (queued_written == queued_data.size()) {
-      // Successfully sent queued data
-      this->audio_queue_.pop();
-      ESP_LOGD(TAG, "Sent queued audio chunk (%zu bytes)", queued_data.size());
-    } else if (queued_written > 0) {
-      // Partially sent - remove sent portion and keep remainder
-      if (queued_written < queued_data.size()) {
-        // Check heap before creating remainder vector
-#ifdef USE_ESP_IDF
-        size_t free_heap = esp_get_free_heap_size();
-        if (free_heap < MIN_FREE_HEAP_BYTES) {
-          ESP_LOGW(TAG, "Low heap (%zu bytes), dropping remainder instead of queuing", free_heap);
-          this->audio_queue_.pop();
-          break;  // Drop remainder to preserve memory
-        }
-#endif
-        std::vector<uint8_t> remainder(queued_data.begin() + queued_written, queued_data.end());
-        this->audio_queue_.pop();
-        this->audio_queue_.push(remainder);
-      } else {
-        this->audio_queue_.pop();
-      }
-      ESP_LOGD(TAG, "Partially sent queued audio chunk (%zu/%zu bytes)", queued_written, queued_data.size());
-      break;  // Buffer is getting full, stop processing queue
-    } else {
-      // Buffer still full, can't send queued data yet
-      break;
-    }
-  }
-  
-  // Update last speaker audio time for auto-stop tracking and bot speaking detection
+  // FIFO through the PSRAM ring: append the new audio, then drain as much as the speaker will
+  // accept. Strict order (never plays new bytes ahead of buffered backlog) with ZERO per-chunk
+  // heap allocation — this is the fix for the long-playback (read-a-book) OOM crash.
   this->last_speaker_audio_time_ = millis();
-  
-  // Send new audio data
-  size_t bytes_written = this->speaker_->play(data, len);
-  
-  if (bytes_written == 0 && len > 0) {
-    // Speaker buffer is full - queue the data for later
-    // Check heap and queue size before attempting to queue
+  this->audio_ring_push_(data, len);
+  this->audio_ring_drain_();
+}
+
+// ---- PSRAM audio backlog ring buffer (see header) ----------------------------------------
+void VoiceAssistantWebSocket::audio_ring_init_() {
+  if (this->audio_ring_ != nullptr) return;
 #ifdef USE_ESP_IDF
-    size_t free_heap = esp_get_free_heap_size();
-    if (free_heap < MIN_FREE_HEAP_BYTES) {
-      ESP_LOGW(TAG, "Low heap (%zu bytes), dropping audio chunk (%zu bytes)", free_heap, len);
-      return;  // Drop audio to preserve memory
-    }
+  this->audio_ring_ = static_cast<uint8_t *>(heap_caps_malloc(AUDIO_RING_CAPACITY, MALLOC_CAP_SPIRAM));
+  if (this->audio_ring_ == nullptr) {
+    ESP_LOGE(TAG, "PSRAM audio ring alloc failed (%zu bytes); trying internal", AUDIO_RING_CAPACITY);
+    this->audio_ring_ = static_cast<uint8_t *>(heap_caps_malloc(AUDIO_RING_CAPACITY, MALLOC_CAP_8BIT));
+  }
+#else
+  this->audio_ring_ = static_cast<uint8_t *>(malloc(AUDIO_RING_CAPACITY));
 #endif
-    if (this->audio_queue_.size() >= MAX_QUEUE_SIZE) {
-      ESP_LOGW(TAG, "Audio queue at max size (%zu/%zu), dropping audio to prevent memory overflow", 
-               this->audio_queue_.size(), MAX_QUEUE_SIZE);
-      return;  // Drop audio instead of causing memory overflow
-    }
-    // Try to create vector - if allocation fails, it will crash, but we've checked heap above
-    std::vector<uint8_t> queued_chunk(data, data + len);
-    this->audio_queue_.push(queued_chunk);
-    ESP_LOGD(TAG, "Speaker buffer full, queued %zu bytes (queue size: %zu/%zu)", 
-             len, this->audio_queue_.size(), MAX_QUEUE_SIZE);
-  } else if (bytes_written < len) {
-    // Partially written - queue the remainder
-#ifdef USE_ESP_IDF
-    size_t free_heap = esp_get_free_heap_size();
-    if (free_heap < MIN_FREE_HEAP_BYTES) {
-      ESP_LOGW(TAG, "Low heap (%zu bytes), dropping remainder (%zu bytes)", free_heap, len - bytes_written);
-      return;  // Drop remainder to preserve memory
-    }
-#endif
-    if (this->audio_queue_.size() >= MAX_QUEUE_SIZE) {
-      ESP_LOGW(TAG, "Audio queue at max size (%zu/%zu), dropping remainder to prevent memory overflow", 
-               this->audio_queue_.size(), MAX_QUEUE_SIZE);
-      return;  // Drop remainder instead of causing memory overflow
-    }
-    // Try to create vector - if allocation fails, it will crash, but we've checked heap above
-    std::vector<uint8_t> remainder(data + bytes_written, data + len);
-    this->audio_queue_.push(remainder);
-    ESP_LOGD(TAG, "Partially wrote %zu/%zu bytes, queued remainder (queue size: %zu/%zu)", 
-             bytes_written, len, this->audio_queue_.size(), MAX_QUEUE_SIZE);
+  if (this->audio_ring_ == nullptr) {
+    ESP_LOGE(TAG, "Audio ring allocation failed — backlogged audio will be dropped");
+  }
+  this->audio_ring_read_ = 0;
+  this->audio_ring_fill_ = 0;
+}
+
+void VoiceAssistantWebSocket::audio_ring_push_(const uint8_t *data, size_t len) {
+  if (this->audio_ring_ == nullptr || data == nullptr || len == 0) return;
+  size_t avail = AUDIO_RING_CAPACITY - this->audio_ring_fill_;
+  if (len > avail) {
+    // Backlog full. Server paces ~real-time, so this is rare jitter, not steady state — drop the
+    // chunk rather than ever growing memory. (Bounded by construction: this is the OOM guard.)
+    ESP_LOGW(TAG, "Audio ring full (%zu/%zu), dropping %zu bytes", this->audio_ring_fill_,
+             AUDIO_RING_CAPACITY, len);
+    return;
+  }
+  size_t write = (this->audio_ring_read_ + this->audio_ring_fill_) % AUDIO_RING_CAPACITY;
+  size_t first = std::min(len, AUDIO_RING_CAPACITY - write);   // bytes until wrap
+  memcpy(this->audio_ring_ + write, data, first);
+  if (len > first) memcpy(this->audio_ring_, data + first, len - first);
+  this->audio_ring_fill_ += len;
+}
+
+void VoiceAssistantWebSocket::audio_ring_drain_() {
+  if (this->audio_ring_ == nullptr || this->speaker_ == nullptr) return;
+  while (this->audio_ring_fill_ > 0) {
+    size_t contiguous = std::min(this->audio_ring_fill_, AUDIO_RING_CAPACITY - this->audio_ring_read_);
+    size_t written = this->speaker_->play(this->audio_ring_ + this->audio_ring_read_, contiguous);
+    if (written == 0) break;   // speaker buffer full — retry next loop()
+    this->audio_ring_read_ = (this->audio_ring_read_ + written) % AUDIO_RING_CAPACITY;
+    this->audio_ring_fill_ -= written;
   }
 }
 
+void VoiceAssistantWebSocket::audio_ring_clear_() {
+  this->audio_ring_read_ = 0;
+  this->audio_ring_fill_ = 0;
+}
+
 void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &data) {
-  // Only process if connected and running
-  if (!this->is_connected() || this->state_ != VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
+  // Only process if connected. Normally we stream only during a RUNNING session — BUT during
+  // enrollment ("teach me my voice") there is no wake-session: the mic is pinned open with wake
+  // disarmed, and the server needs every rep frame to build the training WAV. Without the
+  // `enrolling_` exception the enrollment recorder captured ~nothing (empty WAVs).
+  if (!this->is_connected() ||
+      (this->state_ != VOICE_ASSISTANT_WEBSOCKET_RUNNING && !this->enrolling_)) {
     return;
   }
   
-  // Block microphone audio if bot is currently speaking — EXCEPT during enrollment, where
-  // the mic is pinned open and must keep streaming reps even while the coach TTS plays.
+  // Barge-in policy (see NEO_FULL_DUPLEX_BARGEIN in the header):
+  //  * DEFAULT (half-duplex): don't stream the mic while Neo is speaking, so room cross-talk /
+  //    echo isn't committed as user input. Full-duplex flooded noisy rooms with phantom turns
+  //    (a person talking nearby got treated as commands). Barge-in is via the WAKE WORD instead:
+  //    micro_wake_word keeps listening locally during the reply, and saying "Neo" fires
+  //    voice_assistant_websocket.interrupt (on_wake_word_detected in the YAML).
+  //  * FULL-DUPLEX build (quiet single-person room): define NEO_FULL_DUPLEX_BARGEIN 1 to drop the
+  //    guard and stream continuously so you can talk over Neo to interrupt (relies on XMOS AEC).
+  // Enrollment pins the mic open regardless of this guard.
+#if !NEO_FULL_DUPLEX_BARGEIN
   if (this->is_bot_speaking() && !this->enrolling_) {
-    return;  // Don't send microphone audio while bot is speaking
+    return;
   }
-  
+#endif
+
   // Microphone is configured for 16kHz, 32-bit, stereo (required by micro_wake_word)
   // OpenAI expects 24kHz, 16-bit, mono (non-beta API requirement)
   // Convert: 32-bit stereo -> 16-bit mono (16kHz) -> resample to 24kHz
@@ -623,10 +595,8 @@ void VoiceAssistantWebSocket::interrupt() {
     if (this->speaker_ != nullptr) {
       this->speaker_->stop();
     }
-    // Clear audio queue to free memory and prevent overflow
-    while (!this->audio_queue_.empty()) {
-      this->audio_queue_.pop();
-    }
+    // Drop the audio backlog so buffered speech stops immediately on interrupt
+    this->audio_ring_clear_();
     // Set interrupt time to ignore incoming audio for a short period
     // This gives the server time to process the interrupt and stop sending audio
     this->interrupt_time_ = millis();

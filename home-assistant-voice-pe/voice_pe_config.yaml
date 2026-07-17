@@ -974,7 +974,7 @@ speaker:
     dac_type: external
     channel: stereo  # Voice PE hardware expects stereo
     timeout: never
-    buffer_duration: 100ms
+    buffer_duration: 300ms   # was 100ms — larger PSRAM buffer absorbs reply bursts (fixes garbled audio / dropped chunks)
     audio_dac: aic3204_dac
   
   # Virtual speaker to combine announcement and media streams together into one output
@@ -1003,7 +1003,7 @@ speaker:
     output_speaker: announcement_mixing_input
     sample_rate: 48000  # Output sample rate
     bits_per_sample: 16
-    buffer_duration: 500ms
+    buffer_duration: 2000ms   # was 500ms — the buffer the websocket plays into; bigger = absorbs multi-segment reply bursts so speaker.play() rarely returns 0 (no queue overflow → no dropped audio)
 
 # Media Player for voice assistant audio output (like original HA Voice)
 media_player:
@@ -1218,14 +1218,14 @@ voice_assistant_websocket:
 # - AEC (Acoustic Echo Cancellation): Removes echo from speaker output
 # - AGC (Auto Gain Control): Automatically adjusts microphone gain for consistent volume
 # - NS (Noise Suppression): Reduces background noise
-# Note: AEC is always active in hardware. channel_stage selects additional processing.
-# We enable AGC on both channels for automatic gain control (consistent volume levels)
+# Note: AEC is always active in hardware. channel_stage selects ADDITIONAL processing.
+# Match the stock Nabu Casa config: NO channel_stage (no AGC/NS). AGC re-amplifies the residual
+# echo the AEC couldn't fully cancel → breaks barge-in (echo false-triggers the VAD and masks the
+# user's voice). Leaving these unset uses the clean AEC-only output, as the proven stock firmware does.
 voice_kit:
   id: voice_kit_component
   i2c_id: internal_i2c
   reset_pin: GPIO4
-  channel_0_stage: AGC  # Enable Auto Gain Control on channel 0 (left microphone) - AEC is always active in hardware
-  channel_1_stage: NS  # Enable Auto Gain Control on channel 1 (right microphone) - AEC is always active in hardware
   firmware:
     url: https://github.com/esphome/voice-kit-xmos-firmware/releases/download/v1.3.1/ffva_v1.3.1_upgrade.bin
     version: "1.3.1"
