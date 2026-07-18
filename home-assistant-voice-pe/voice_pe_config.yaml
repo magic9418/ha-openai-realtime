@@ -1096,6 +1096,21 @@ micro_wake_word:
         condition:
           switch.is_off: master_mute_switch
         then:
+          # Barge-in FIRST — before the chime and the wake-open delay. If Neo is mid-reply, "Neo"
+          # must cut it in ~a WS round-trip, not ~1s later. The chime + ${wake_open_delay_ms} below
+          # is an echo guard on the MIC-forward path; gating the stop behind it means Neo talks over
+          # you for the whole chime+delay window. A re-wake NEVER disconnects the session —
+          # interrupt() leaves it RUNNING so your next request is heard right away.
+          - if:
+              condition:
+                and:
+                  - voice_assistant_websocket.is_running:
+                      id: voice_assistant_ws
+                  - voice_assistant_websocket.is_bot_speaking:
+                      id: voice_assistant_ws
+              then:
+                - voice_assistant_websocket.interrupt:
+                    id: voice_assistant_ws
           # Play wake sound if enabled (for all wake words)
           - if:
               condition:
@@ -1110,26 +1125,14 @@ micro_wake_word:
                 # this knob (from the {"type":"hello"} frame), replace the line below with:
                 #   - delay: !lambda 'return id(voice_assistant_ws)->get_wake_open_delay_ms();'
                 - delay: ${wake_open_delay_ms}
-          # Handle wake word based on session/bot state. A re-wake means "I have
-          # another request" — it must NEVER disconnect the session.
+          # If no session was running, start one. A mid-session re-wake stays open (handled above),
+          # so this only fires for a cold wake.
           - if:
               condition:
-                voice_assistant_websocket.is_running:
-                  id: voice_assistant_ws
+                not:
+                  voice_assistant_websocket.is_running:
+                    id: voice_assistant_ws
               then:
-                # Already in a session. If the bot is mid-reply, "Neo" interrupts so
-                # you can ask something else right away. If it's just listening, do
-                # nothing — the wake chirp already acknowledged; keep the session open
-                # and just talk. (No stop-on-re-wake; end via the button or auto-stop.)
-                - if:
-                    condition:
-                      voice_assistant_websocket.is_bot_speaking:
-                        id: voice_assistant_ws
-                    then:
-                      - voice_assistant_websocket.interrupt:
-                          id: voice_assistant_ws
-              else:
-                # Voice assistant not running - start it
                 - voice_assistant_websocket.start:
                     id: voice_assistant_ws
 
