@@ -54,6 +54,9 @@ substitutions:
   # Custom "Neo" model (trained 2026-07-10, int8 streaming). To fall back to a stock
   # trigger, set this to `okay_nabu`. github URL alt:
   #   github://magic9418/ha-openai-realtime/home-assistant-voice-pe/wake_words/neo.json@local-fixes
+  # Custom "Neo" v2 model. Requires the ESPHome 2026.6.5 toolchain (pinned in pyproject.toml) —
+  # on 2025.11.4 the v2 tensor arena fails to allocate. To fall back to a stock trigger, set
+  # `okay_nabu`. github URL alt: github://magic9418/ha-openai-realtime/.../wake_words/neo.json@local-fixes
   wake_word_model: wake_words/neo.json
 
 esphome:
@@ -982,7 +985,7 @@ speaker:
     dac_type: external
     channel: stereo  # Voice PE hardware expects stereo
     timeout: never
-    buffer_duration: 300ms   # was 100ms — larger PSRAM buffer absorbs reply bursts (fixes garbled audio / dropped chunks)
+    buffer_duration: 100ms   # 7/12 known-good. (Bumping this ate internal RAM that micro_wake_word needs for its tensor arena → wake word failed to start. The PSRAM ring buffer now absorbs reply bursts instead.)
     audio_dac: aic3204_dac
   
   # Virtual speaker to combine announcement and media streams together into one output
@@ -1011,7 +1014,7 @@ speaker:
     output_speaker: announcement_mixing_input
     sample_rate: 48000  # Output sample rate
     bits_per_sample: 16
-    buffer_duration: 2000ms   # was 500ms — the buffer the websocket plays into; bigger = absorbs multi-segment reply bursts so speaker.play() rarely returns 0 (no queue overflow → no dropped audio)
+    buffer_duration: 500ms   # 7/12 known-good (was bumped to 2000ms; that RAM starved micro_wake_word). PSRAM ring buffer absorbs bursts now.
 
 # Media Player for voice assistant audio output (like original HA Voice)
 media_player:
@@ -1234,6 +1237,10 @@ voice_kit:
   id: voice_kit_component
   i2c_id: internal_i2c
   reset_pin: GPIO4
+  # 7/12 known-good XMOS channel processing (AEC always on in HW; these add AGC/NS). Removing them
+  # was part of the full-duplex barge-in experiment we've since dropped for wake-word barge-in.
+  channel_0_stage: AGC
+  channel_1_stage: NS
   firmware:
     url: https://github.com/esphome/voice-kit-xmos-firmware/releases/download/v1.3.1/ffva_v1.3.1_upgrade.bin
     version: "1.3.1"

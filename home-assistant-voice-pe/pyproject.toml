@@ -10,7 +10,11 @@ package-mode = false
 python = ">=3.11,<3.14"
 
 [tool.poetry.group.dev.dependencies]
-esphome = "^2025.11.4"
+# Pinned exactly to the known-good toolchain: the device's working bin (2026-07-12) runs ESPHome
+# 2026.6.5 / ESP-IDF 5.5.4, where the micro_wake_word v2 tensor-arena allocation works. The old
+# "^2025.11.4" caret capped us below 2026.x and resolved DOWN to 2025.11.4, which has the
+# "Failed to allocate tensors for the streaming model" bug (esphome#15603/#7242). See DEFERRED_WORK.md.
+esphome = "2026.6.5"
 
 [build-system]
 requires = ["poetry-core"]

@@ -133,7 +133,7 @@ class VoiceAssistantWebSocket : public Component {
   // scarce ~300 KB internal DRAM, which fragmented it and OOM-crashed the PE on long playback
   // (reading a whole book). Pre-allocated ONCE from the 8 MB PSRAM → no per-chunk allocation, no
   // fragmentation, safe for unbounded-length reads. The server paces ~real-time, so fill stays low.
-  static const size_t AUDIO_RING_CAPACITY = 256 * 1024;  // ~10s @24kHz mono16 of jitter headroom
+  static const size_t AUDIO_RING_CAPACITY = 96 * 1024;   // ~2s @24kHz mono16 of jitter headroom (kept modest so it never competes with micro_wake_word's tensor arena for memory)
   uint8_t *audio_ring_{nullptr};
   size_t audio_ring_read_{0};   // read cursor
   size_t audio_ring_fill_{0};   // bytes currently buffered
