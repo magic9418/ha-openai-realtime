@@ -179,6 +179,13 @@ class VoiceAssistantWebSocket : public Component {
   // (matches the YAML ${wake_open_delay_ms} substitution) if no hello arrives.
   uint32_t wake_open_delay_ms_{320};
 
+  // Mic-forward gate: drop uplink frames until this millis() timestamp. Set on every wake
+  // (start() for a cold wake, interrupt() for a barge-in re-wake) to wake_open_delay_ms_ from now,
+  // so the wake chime doesn't bleed into ASR — while the WS connect runs *underneath* it instead
+  // of after it. Lets the mic open ~wake_open_delay_ms after wake regardless of connect latency,
+  // instead of chime + delay + connect (which ate the front of the user's command). 0 = no gate.
+  uint32_t mic_gate_until_{0};
+
   // Enrollment mode: mic pinned open + streaming, wake/stop models disarmed by YAML.
   // Auto-restores on {"enroll","stop"}, WS drop, or the 15-min safety cap.
   bool enrolling_{false};

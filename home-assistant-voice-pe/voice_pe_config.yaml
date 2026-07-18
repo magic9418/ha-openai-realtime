@@ -1096,11 +1096,9 @@ micro_wake_word:
         condition:
           switch.is_off: master_mute_switch
         then:
-          # Barge-in FIRST — before the chime and the wake-open delay. If Neo is mid-reply, "Neo"
-          # must cut it in ~a WS round-trip, not ~1s later. The chime + ${wake_open_delay_ms} below
-          # is an echo guard on the MIC-forward path; gating the stop behind it means Neo talks over
-          # you for the whole chime+delay window. A re-wake NEVER disconnects the session —
-          # interrupt() leaves it RUNNING so your next request is heard right away.
+          # Barge-in FIRST — before the chime. If Neo is mid-reply, "Neo" must cut it in ~a WS
+          # round-trip, not ~1s later. A re-wake NEVER disconnects the session — interrupt() leaves
+          # it RUNNING (and opens the mic for the follow-up) so your next request is heard right away.
           - if:
               condition:
                 and:
@@ -1111,22 +1109,10 @@ micro_wake_word:
               then:
                 - voice_assistant_websocket.interrupt:
                     id: voice_assistant_ws
-          # Play wake sound if enabled (for all wake words)
-          - if:
-              condition:
-                switch.is_on: wake_sound
-              then:
-                - script.execute:
-                    id: play_sound
-                    priority: true
-                    sound_file: !lambda 'return id(wake_word_triggered_sound);'
-                # Echo guard: let the chime tail play out before mic frames are forwarded.
-                # Substitution default (${wake_open_delay_ms}, 320ms). To let the server own
-                # this knob (from the {"type":"hello"} frame), replace the line below with:
-                #   - delay: !lambda 'return id(voice_assistant_ws)->get_wake_open_delay_ms();'
-                - delay: ${wake_open_delay_ms}
-          # If no session was running, start one. A mid-session re-wake stays open (handled above),
-          # so this only fires for a cold wake.
+          # Cold wake: START the session BEFORE the chime, so the WS connect runs *underneath* the
+          # chime instead of after it. The mic then opens ~wake_open_delay_ms after wake (the
+          # component's mic-gate covers the chime), not chime + delay + connect — which used to eat
+          # the front of your first command. A mid-session re-wake stays open (handled above).
           - if:
               condition:
                 not:
@@ -1135,6 +1121,17 @@ micro_wake_word:
               then:
                 - voice_assistant_websocket.start:
                     id: voice_assistant_ws
+          # Play the wake chime (all wake words). No YAML delay here anymore: the echo guard is now
+          # the component's mic-gate (armed by start()/interrupt() to wake_open_delay_ms), which
+          # drops uplink for the chime window while the connect overlaps it.
+          - if:
+              condition:
+                switch.is_on: wake_sound
+              then:
+                - script.execute:
+                    id: play_sound
+                    priority: true
+                    sound_file: !lambda 'return id(wake_word_triggered_sound);'
 
 # External Components - Custom voice_assistant_websocket component
 external_components:

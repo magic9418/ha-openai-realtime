@@ -144,9 +144,14 @@ void VoiceAssistantWebSocket::start() {
   
   ESP_LOGI(TAG, "Starting Voice Assistant WebSocket...");
   this->state_ = VOICE_ASSISTANT_WEBSOCKET_STARTING;
-  
+
   // Reset auto-stop tracking
   this->last_speaker_audio_time_ = 0;
+
+  // Arm the mic-forward gate for the wake chime. The YAML now calls start() BEFORE the chime, so
+  // connect_websocket_() runs underneath the chime instead of after it — the mic opens ~this delay
+  // after wake (protecting ASR from the chime) instead of chime + delay + connect.
+  this->mic_gate_until_ = millis() + this->wake_open_delay_ms_;
   
   // Reset explicit disconnect flag for new session
   this->explicit_disconnect_ = false;
@@ -457,6 +462,16 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   }
 #endif
 
+  // Wake-chime gate: drop uplink for the wake-open window after a wake so the chime doesn't bleed
+  // into ASR. The WS connect overlaps this window, so the mic opens ~wake_open_delay_ms after wake
+  // (not chime + delay + connect). Enrollment pins the mic open regardless.
+  if (!this->enrolling_ && this->mic_gate_until_ != 0) {
+    if ((int32_t)(millis() - this->mic_gate_until_) < 0) {
+      return;
+    }
+    this->mic_gate_until_ = 0;  // window elapsed — stop paying the compare every frame
+  }
+
   // Microphone is configured for 16kHz, 32-bit, stereo (required by micro_wake_word)
   // OpenAI expects 24kHz, 16-bit, mono (non-beta API requirement)
   // Convert: 32-bit stereo -> 16-bit mono (16kHz) -> resample to 24kHz
@@ -597,6 +612,13 @@ void VoiceAssistantWebSocket::interrupt() {
     }
     // Drop the audio backlog so buffered speech stops immediately on interrupt
     this->audio_ring_clear_();
+    // Open the mic for the follow-up NOW: clear last_speaker_audio_time_ so is_bot_speaking()
+    // (the half-duplex guard) reads false immediately instead of staying true ~500ms after the
+    // last server frame — that lingering guard ate the front of the barge-in follow-up command.
+    // (Consistent with start(), which also zeroes it to re-arm auto-stop for the fresh turn.)
+    this->last_speaker_audio_time_ = 0;
+    // But still gate the barge-in chime out of ASR for the wake-open window.
+    this->mic_gate_until_ = millis() + this->wake_open_delay_ms_;
     // Set interrupt time to ignore incoming audio for a short period
     // This gives the server time to process the interrupt and stop sending audio
     this->interrupt_time_ = millis();
