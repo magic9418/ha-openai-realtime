@@ -78,7 +78,9 @@ esphome:
       - delay: 4s
       - micro_wake_word.start:
           id: mww
-      - lambda: id(init_in_progress) = false;
+      - lambda: |-
+          id(init_in_progress) = false;
+          id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  // idle baseline w/o HA
       - script.execute: control_leds
 
 esp32:
@@ -690,7 +692,10 @@ script:
             id(control_leds_improv_ble_state).execute();
           } else if (id(init_in_progress)) {
             id(control_leds_init_state).execute();
-          } else if (!id(wifi_id).is_connected() || !id(api_id).is_connected()){
+          } else if (!id(wifi_id).is_connected()){
+            // HA-independent: the ring's "no connection" state depends on WiFi only (needed to
+            // reach session-server). It used to also require the HA api connection, which stuck
+            // the ring on this state whenever the PE wasn't in HA — masking all voice colors.
             id(control_leds_no_ha_connection_state).execute();
           } else if (id(center_button).state) {
             id(control_leds_center_button_touched).execute();
