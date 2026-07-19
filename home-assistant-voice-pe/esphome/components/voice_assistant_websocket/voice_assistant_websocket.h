@@ -141,7 +141,16 @@ class VoiceAssistantWebSocket : public Component {
   void audio_ring_push_(const uint8_t *data, size_t len);
   void audio_ring_drain_();
   void audio_ring_clear_();
-  
+
+  // Closed-loop audio flow control (docs/long_reply_flow_control_plan.md). The server pre-fills only
+  // into advertised ring headroom, so the ring never overflows (no dropped/garbled audio) and
+  // buffering is bounded no matter how long the reply. Enabled only when the server's hello carries
+  // "flow_control":"credit" (old servers → stays open-loop, server time-paces as before).
+  bool flow_control_enabled_{false};
+  size_t audio_free_reported_fill_{0};   // ring fill at the last report (hysteresis reference)
+  static const size_t AUDIO_FREE_REPORT_QUANTUM = AUDIO_RING_CAPACITY / 4;  // report every ~0.5s drained/filled
+  void report_audio_free_(bool force);   // send {"type":"audio_free","bytes":<capacity-fill>}
+
   // Timing
   uint32_t last_audio_send_{0};
   uint32_t last_audio_receive_{0};

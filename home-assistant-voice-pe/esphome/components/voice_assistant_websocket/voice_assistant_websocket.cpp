@@ -419,6 +419,7 @@ void VoiceAssistantWebSocket::audio_ring_push_(const uint8_t *data, size_t len) 
   memcpy(this->audio_ring_ + write, data, first);
   if (len > first) memcpy(this->audio_ring_, data + first, len - first);
   this->audio_ring_fill_ += len;
+  this->report_audio_free_(false);   // fill rose → advertise reduced headroom to the server
 }
 
 void VoiceAssistantWebSocket::audio_ring_drain_() {
@@ -430,11 +431,29 @@ void VoiceAssistantWebSocket::audio_ring_drain_() {
     this->audio_ring_read_ = (this->audio_ring_read_ + written) % AUDIO_RING_CAPACITY;
     this->audio_ring_fill_ -= written;
   }
+  this->report_audio_free_(false);   // fill fell → advertise freed headroom so the server tops up
 }
 
 void VoiceAssistantWebSocket::audio_ring_clear_() {
   this->audio_ring_read_ = 0;
   this->audio_ring_fill_ = 0;
+  this->report_audio_free_(true);    // ring emptied (interrupt/flush) → re-prime the server now
+}
+
+// Closed-loop flow control: tell the server how many bytes are free in the PSRAM ring so it sends
+// only into real headroom. Absolute (capacity - fill), not a delta, so a dropped report is self-
+// correcting. Hysteresis (QUANTUM) keeps this to a few frames/second, not one per audio chunk.
+void VoiceAssistantWebSocket::report_audio_free_(bool force) {
+  if (!this->flow_control_enabled_ || !this->is_connected()) return;
+  size_t delta = (this->audio_ring_fill_ > this->audio_free_reported_fill_)
+                     ? this->audio_ring_fill_ - this->audio_free_reported_fill_
+                     : this->audio_free_reported_fill_ - this->audio_ring_fill_;
+  if (!force && delta < AUDIO_FREE_REPORT_QUANTUM) return;
+  this->audio_free_reported_fill_ = this->audio_ring_fill_;
+  size_t free_bytes = AUDIO_RING_CAPACITY - this->audio_ring_fill_;
+  char buf[64];
+  snprintf(buf, sizeof(buf), "{\"type\":\"audio_free\",\"bytes\":%zu}", free_bytes);
+  this->send_text_frame_(buf);
 }
 
 void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &data) {
@@ -704,6 +723,8 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
           if (this->speaker_ != nullptr) {
             this->speaker_->stop();
           }
+          this->audio_ring_clear_();   // drop buffered backlog (matches the local barge-in path) +
+                                       // re-prime flow control so the next reply starts with full headroom
         } else if (message.find("\"type\":\"disconnect\"") != std::string::npos ||
                    message.find("\"type\": \"disconnect\"") != std::string::npos) {
           ESP_LOGI(TAG, "Disconnect message received, stopping voice assistant and going to idle");
@@ -728,6 +749,16 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
                 ESP_LOGI(TAG, "hello: wake_open_delay_ms = %u", this->wake_open_delay_ms_);
               }
             }
+          }
+          // Opt into closed-loop audio flow control if the server advertises it. Prime the server
+          // with our full ring capacity so it can send the first ~2s before our first drain report.
+          if (message.find("\"flow_control\":\"credit\"") != std::string::npos ||
+              message.find("\"flow_control\": \"credit\"") != std::string::npos) {
+            this->flow_control_enabled_ = true;
+            this->audio_free_reported_fill_ = this->audio_ring_fill_;
+            ESP_LOGI(TAG, "hello: flow_control=credit — reporting audio_free (%zu B ring)",
+                     AUDIO_RING_CAPACITY);
+            this->report_audio_free_(true);
           }
         } else if (message.find("\"type\":\"enroll\"") != std::string::npos ||
                    message.find("\"type\": \"enroll\"") != std::string::npos) {
