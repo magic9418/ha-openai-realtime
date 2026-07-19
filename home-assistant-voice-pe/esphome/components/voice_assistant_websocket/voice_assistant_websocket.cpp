@@ -203,13 +203,8 @@ void VoiceAssistantWebSocket::stop() {
   // The microphone can be shared between multiple components in ESPHome
   // micro_wake_word will continue to work even when voice_assistant_websocket is stopped
   ESP_LOGD(TAG, "Keeping microphone running for micro_wake_word");
-  // Stop speaker if it's running
-  if (this->speaker_ != nullptr) {
-    this->speaker_->stop();
-  }
-  
-  // Clear the audio backlog ring
-  this->audio_ring_clear_();
+  // Stop speaker + empty the backlog ring atomically (serialized against the main-task drain).
+  this->audio_ring_flush_and_stop_speaker_();
 
   if (this->state_callback_) {
     this->state_callback_(this->state_);
@@ -402,16 +397,21 @@ void VoiceAssistantWebSocket::audio_ring_init_() {
   }
   this->audio_ring_read_ = 0;
   this->audio_ring_fill_ = 0;
+  if (this->audio_ring_lock_ == nullptr) {
+    this->audio_ring_lock_ = xSemaphoreCreateMutex();   // serialize drain vs push/clear/stop
+  }
 }
 
 void VoiceAssistantWebSocket::audio_ring_push_(const uint8_t *data, size_t len) {
   if (this->audio_ring_ == nullptr || data == nullptr || len == 0) return;
+  if (this->audio_ring_lock_ != nullptr) xSemaphoreTake(this->audio_ring_lock_, portMAX_DELAY);
   size_t avail = AUDIO_RING_CAPACITY - this->audio_ring_fill_;
   if (len > avail) {
     // Backlog full. Server paces ~real-time, so this is rare jitter, not steady state — drop the
     // chunk rather than ever growing memory. (Bounded by construction: this is the OOM guard.)
     ESP_LOGW(TAG, "Audio ring full (%zu/%zu), dropping %zu bytes", this->audio_ring_fill_,
              AUDIO_RING_CAPACITY, len);
+    if (this->audio_ring_lock_ != nullptr) xSemaphoreGive(this->audio_ring_lock_);
     return;
   }
   size_t write = (this->audio_ring_read_ + this->audio_ring_fill_) % AUDIO_RING_CAPACITY;
@@ -419,25 +419,47 @@ void VoiceAssistantWebSocket::audio_ring_push_(const uint8_t *data, size_t len) 
   memcpy(this->audio_ring_ + write, data, first);
   if (len > first) memcpy(this->audio_ring_, data + first, len - first);
   this->audio_ring_fill_ += len;
+  if (this->audio_ring_lock_ != nullptr) xSemaphoreGive(this->audio_ring_lock_);
   this->report_audio_free_(false);   // fill rose → advertise reduced headroom to the server
 }
 
 void VoiceAssistantWebSocket::audio_ring_drain_() {
   if (this->audio_ring_ == nullptr || this->speaker_ == nullptr) return;
+  // Hold the lock across the whole drain (including speaker_->play(), which is non-blocking): a
+  // concurrent barge-in clear/stop must not zero fill between the play and the `fill -= written`
+  // (that underflowed size_t → endless "loop audio") nor stop the speaker mid-play.
+  if (this->audio_ring_lock_ != nullptr) xSemaphoreTake(this->audio_ring_lock_, portMAX_DELAY);
   while (this->audio_ring_fill_ > 0) {
     size_t contiguous = std::min(this->audio_ring_fill_, AUDIO_RING_CAPACITY - this->audio_ring_read_);
     size_t written = this->speaker_->play(this->audio_ring_ + this->audio_ring_read_, contiguous);
     if (written == 0) break;   // speaker buffer full — retry next loop()
+    if (written > this->audio_ring_fill_) written = this->audio_ring_fill_;   // belt-and-braces: never underflow
     this->audio_ring_read_ = (this->audio_ring_read_ + written) % AUDIO_RING_CAPACITY;
     this->audio_ring_fill_ -= written;
   }
+  if (this->audio_ring_lock_ != nullptr) xSemaphoreGive(this->audio_ring_lock_);
   this->report_audio_free_(false);   // fill fell → advertise freed headroom so the server tops up
 }
 
 void VoiceAssistantWebSocket::audio_ring_clear_() {
+  if (this->audio_ring_lock_ != nullptr) xSemaphoreTake(this->audio_ring_lock_, portMAX_DELAY);
   this->audio_ring_read_ = 0;
   this->audio_ring_fill_ = 0;
+  if (this->audio_ring_lock_ != nullptr) xSemaphoreGive(this->audio_ring_lock_);
   this->report_audio_free_(true);    // ring emptied (interrupt/flush) → re-prime the server now
+}
+
+// Barge-in / server interrupt: stop the speaker AND empty the ring as one atomic step, serialized
+// against a concurrent drain. Doing the two separately (the old `speaker_->stop(); audio_ring_clear_()`)
+// let the main-task drain push already-buffered stale bytes into the speaker AFTER the stop — the
+// audio that "kept talking" / looped after a break-in. Callers run on the websocket task.
+void VoiceAssistantWebSocket::audio_ring_flush_and_stop_speaker_() {
+  if (this->audio_ring_lock_ != nullptr) xSemaphoreTake(this->audio_ring_lock_, portMAX_DELAY);
+  if (this->speaker_ != nullptr) this->speaker_->stop();
+  this->audio_ring_read_ = 0;
+  this->audio_ring_fill_ = 0;
+  if (this->audio_ring_lock_ != nullptr) xSemaphoreGive(this->audio_ring_lock_);
+  this->report_audio_free_(true);
 }
 
 // Closed-loop flow control: tell the server how many bytes are free in the PSRAM ring so it sends
@@ -625,12 +647,9 @@ void VoiceAssistantWebSocket::interrupt() {
     ESP_LOGW(TAG, "Failed to send interrupt message");
   } else {
     ESP_LOGI(TAG, "Interrupt message sent successfully");
-    // Stop speaker immediately after sending interrupt
-    if (this->speaker_ != nullptr) {
-      this->speaker_->stop();
-    }
-    // Drop the audio backlog so buffered speech stops immediately on interrupt
-    this->audio_ring_clear_();
+    // Stop speaker + drop the backlog atomically so buffered speech stops immediately on interrupt
+    // (and the main-task drain can't re-feed stale bytes into the speaker after the stop).
+    this->audio_ring_flush_and_stop_speaker_();
     // Open the mic for the follow-up NOW: clear last_speaker_audio_time_ so is_bot_speaking()
     // (the half-duplex guard) reads false immediately instead of staying true ~500ms after the
     // last server frame — that lingering guard ate the front of the barge-in follow-up command.
@@ -720,11 +739,9 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
         if (message.find("\"type\":\"interrupt\"") != std::string::npos ||
             message.find("\"type\": \"interrupt\"") != std::string::npos) {
           ESP_LOGI(TAG, "Interrupt received, stopping speaker");
-          if (this->speaker_ != nullptr) {
-            this->speaker_->stop();
-          }
-          this->audio_ring_clear_();   // drop buffered backlog (matches the local barge-in path) +
-                                       // re-prime flow control so the next reply starts with full headroom
+          // Stop speaker + drop backlog atomically (matches the local barge-in path); the serialized
+          // helper stops the main-task drain from re-feeding stale bytes into the speaker after stop.
+          this->audio_ring_flush_and_stop_speaker_();
         } else if (message.find("\"type\":\"disconnect\"") != std::string::npos ||
                    message.find("\"type\": \"disconnect\"") != std::string::npos) {
           ESP_LOGI(TAG, "Disconnect message received, stopping voice assistant and going to idle");

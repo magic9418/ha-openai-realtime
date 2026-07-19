@@ -9,6 +9,7 @@
 #include "esp_http_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"   // audio_ring_lock_ mutex (serialize ring drain vs push/clear/stop)
 #include "esp_system.h"
 #include "esp_heap_caps.h"   // heap_caps_malloc for the PSRAM audio ring buffer
 #endif
@@ -137,10 +138,18 @@ class VoiceAssistantWebSocket : public Component {
   uint8_t *audio_ring_{nullptr};
   size_t audio_ring_read_{0};   // read cursor
   size_t audio_ring_fill_{0};   // bytes currently buffered
+  // The ring is touched from TWO tasks: the main loop() drains it into the speaker, while the
+  // websocket task pushes new audio AND (on barge-in / server interrupt) clears it + stops the
+  // speaker. Unserialized, a clear that zeroes fill mid-drain made `fill -= written` underflow a
+  // size_t → the drain looped on stale bytes forever ("loop audio" after a break-in) and the free
+  // report ran away past capacity. This mutex serializes every ring mutation and the speaker
+  // stop/clear against the drain's speaker_->play(). play() is non-blocking, so holding it is cheap.
+  SemaphoreHandle_t audio_ring_lock_{nullptr};
   void audio_ring_init_();
   void audio_ring_push_(const uint8_t *data, size_t len);
   void audio_ring_drain_();
   void audio_ring_clear_();
+  void audio_ring_flush_and_stop_speaker_();   // barge-in: stop speaker + empty ring, atomically
 
   // Closed-loop audio flow control (docs/long_reply_flow_control_plan.md). The server pre-fills only
   // into advertised ring headroom, so the ring never overflows (no dropped/garbled audio) and
