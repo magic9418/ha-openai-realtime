@@ -63,7 +63,22 @@ void VoiceAssistantWebSocket::loop() {
   if (this->speaker_ != nullptr && this->speaker_->is_running() && this->audio_ring_fill_ > 0) {
     this->audio_ring_drain_();
   }
-  
+
+  // Keep the assistant speaker warm between replies (see header). Only once a reply has actually
+  // played (last_speaker_audio_time_ > 0) so a wake with no speech doesn't trickle silence forever;
+  // only when the ring is empty (real audio always wins); self-limiting because once the speaker
+  // buffer fills, drain leaves fill > 0 and this skips. Does NOT update last_speaker_audio_time_.
+  if (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING && !this->enrolling_ &&
+      this->speaker_ != nullptr && this->last_speaker_audio_time_ > 0 &&
+      this->audio_ring_fill_ == 0 &&
+      (millis() - this->last_keepwarm_ms_) >= KEEPWARM_INTERVAL_MS) {
+    this->last_keepwarm_ms_ = millis();
+    if (this->speaker_->is_stopped()) this->speaker_->start();
+    static const uint8_t KEEPWARM_SILENCE[KEEPWARM_SILENCE_BYTES] = {0};
+    this->audio_ring_push_(KEEPWARM_SILENCE, KEEPWARM_SILENCE_BYTES);
+    this->audio_ring_drain_();
+  }
+
   // Handle pending start request
   if (this->pending_start_ && this->state_ == VOICE_ASSISTANT_WEBSOCKET_IDLE) {
     this->pending_start_ = false;

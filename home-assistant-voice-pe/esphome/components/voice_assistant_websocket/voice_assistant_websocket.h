@@ -145,6 +145,13 @@ class VoiceAssistantWebSocket : public Component {
   // report ran away past capacity. This mutex serializes every ring mutation and the speaker
   // stop/clear against the drain's speaker_->play(). play() is non-blocking, so holding it is cheap.
   SemaphoreHandle_t audio_ring_lock_{nullptr};
+  // Speaker keep-warm: between replies the resampler/i2s pipeline otherwise drains to a full stop
+  // and cold-restarts on the next reply — that cold DMA start clips/garbles the opening word. While
+  // a session is active we trickle silence so the pipeline never stops. Silence must NOT touch
+  // last_speaker_audio_time_ (that drives the reply-inactivity auto-stop).
+  uint32_t last_keepwarm_ms_{0};
+  static const uint32_t KEEPWARM_INTERVAL_MS = 20;    // feed ~real-time so the i2s never cold-stops
+  static const size_t KEEPWARM_SILENCE_BYTES = 960;   // 20 ms @ 24 kHz mono16
   void audio_ring_init_();
   void audio_ring_push_(const uint8_t *data, size_t len);
   void audio_ring_drain_();
