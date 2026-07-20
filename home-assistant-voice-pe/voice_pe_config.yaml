@@ -1090,6 +1090,12 @@ micro_wake_word:
     # wakes to "Neo" and nothing else, matching the Neo persona.
     - model: ${wake_word_model}
       id: primary_wake_word
+      # Override the model's default 0.98 cutoff. 0.98 is great when idle but too strict to catch
+      # "Neo" over Neo's own loud playback (the XMOS AEC leaves residual that lowers the model's
+      # confidence) — that's the "had to say Neo 4x to barge in" problem. 0.90 makes barge-in reliable;
+      # trade-off is slightly more idle false-wakes (the flywheel + this knob manage it — raise toward
+      # 0.95 if false triggers get annoying, lower toward 0.85 if barge-in is still stubborn).
+      probability_cutoff: 0.90
     # Extra triggers disabled for the Neo build — uncomment to also wake on these:
     # - model: hey_jarvis
     #   id: hey_jarvis
