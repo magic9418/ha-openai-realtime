@@ -123,6 +123,11 @@ logger:
 
 api:
   id: api_id
+  # Standalone device (not managed by Home Assistant): disable ESPHome's default 15-min
+  # "no API client connected → reboot to recover" watchdog. With no HA, the only API client is
+  # `esphome logs`; when it's not running the device would otherwise self-reboot every ~15 min
+  # (Reset Reason: "Reboot request from api"). 0s = never reboot on an idle API.
+  reboot_timeout: 0s
   encryption:
     key: !secret api_encryption_key
   on_client_connected:
