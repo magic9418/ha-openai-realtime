@@ -1095,7 +1095,8 @@ micro_wake_word:
       # confidence) — that's the "had to say Neo 4x to barge in" problem. 0.90 makes barge-in reliable;
       # trade-off is slightly more idle false-wakes (the flywheel + this knob manage it — raise toward
       # 0.95 if false triggers get annoying, lower toward 0.85 if barge-in is still stubborn).
-      probability_cutoff: 0.90
+      # 2026-08-01: raised to 0.96 — device was over-sensitive (too many idle false-wakes).
+      probability_cutoff: 0.96
     # Extra triggers disabled for the Neo build — uncomment to also wake on these:
     # - model: hey_jarvis
     #   id: hey_jarvis
