@@ -767,6 +767,21 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
               }
             }
           }
+          // Server-driven session auto-stop (HW-agnostic "feeling" setting — the box owns it so PE,
+          // Sat1, and future HW behave identically). Overrides the compiled default when present.
+          size_t akey = message.find("auto_stop_inactivity_ms");
+          if (akey != std::string::npos) {
+            size_t acolon = message.find(':', akey);
+            if (acolon != std::string::npos) {
+              size_t p = acolon + 1;
+              while (p < message.size() && (message[p] == ' ' || message[p] == '\t')) p++;
+              long val = strtol(message.c_str() + p, nullptr, 10);
+              if (val > 0) {
+                this->auto_stop_inactivity_ms_ = static_cast<uint32_t>(val);
+                ESP_LOGI(TAG, "hello: auto_stop_inactivity_ms = %u", this->auto_stop_inactivity_ms_);
+              }
+            }
+          }
           // Opt into closed-loop audio flow control if the server advertises it. Prime the server
           // with our full ring capacity so it can send the first ~2s before our first drain report.
           if (message.find("\"flow_control\":\"credit\"") != std::string::npos ||
