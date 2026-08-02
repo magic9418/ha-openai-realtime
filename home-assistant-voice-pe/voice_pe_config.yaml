@@ -1133,17 +1133,9 @@ micro_wake_word:
               then:
                 - voice_assistant_websocket.start:
                     id: voice_assistant_ws
-          # Play the wake chime (all wake words). No YAML delay here anymore: the echo guard is now
-          # the component's mic-gate (armed by start()/interrupt() to wake_open_delay_ms), which
-          # drops uplink for the chime window while the connect overlaps it.
-          - if:
-              condition:
-                switch.is_on: wake_sound
-              then:
-                - script.execute:
-                    id: play_sound
-                    priority: true
-                    sound_file: !lambda 'return id(wake_word_triggered_sound);'
+          # NEO: wake silently — no wake chime (parity with the Sat1; Matt doesn't want Neo to chime on
+          # wake). Was: play_sound(wake_word_triggered_sound) gated on the wake_sound switch. Removed so
+          # Neo wakes silent on all hardware. Re-add only if a wake tone is wanted again.
 
 # External Components - Custom voice_assistant_websocket component
 external_components:

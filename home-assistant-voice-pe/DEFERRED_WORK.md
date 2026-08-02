@@ -1,5 +1,20 @@
 # Voice PE — deferred work & the wake-word blocker (2026-07-17)
 
+## ⚠️ PENDING FLASH (2026-08-02): code ahead of the device
+
+The following are committed to the PE firmware but **NOT yet flashed** to the office PE
+(192.168.5.29) — Matt is not working on the PE right now, applied for parity with the Sat1:
+- **Barge-in reply pitch fix** — `process_received_audio_` now re-asserts `set_audio_stream_info(24kHz)`
+  when restarting the speaker after a barge-in (else the follow-up reply plays 2× / high-pitched).
+- **Silent wake** — removed the wake chime (`play_sound(wake_word_triggered_sound)`); Neo wakes silent
+  on all HW per Matt's preference.
+- Already flashed earlier (2026-08-02): server-driven `auto_stop_inactivity_ms` parsed from the hello
+  frame. Sat1-only fixes (mic uplink 16k, red-LED no-HA check) do NOT apply to the PE.
+**Compiles clean.** Flash with `poetry run esphome upload voice_pe_config.yaml` (OTA to .29) when ready.
+
+---
+
+
 We hit a hard blocker debugging the PE and are rolling back to a known-good firmware to get a
 working device, then re-applying the work below methodically. This file is the memory of *what*
 we were fixing and *what we learned*, so nothing is lost.

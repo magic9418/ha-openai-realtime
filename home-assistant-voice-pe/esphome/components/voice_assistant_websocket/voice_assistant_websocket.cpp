@@ -369,6 +369,12 @@ void VoiceAssistantWebSocket::process_received_audio_(const uint8_t *data, size_
   // For streaming audio, we want continuous playback
   if (this->speaker_->is_stopped()) {
     ESP_LOGD(TAG, "Speaker is stopped, starting it");
+    // Re-assert the 24kHz input stream info before restarting. start() sets it at session begin,
+    // but a barge-in interrupt STOPS the speaker; restarting here without re-declaring the rate makes
+    // the resampler assume its 48kHz output rate as input (no 24->48 upsample), so the follow-up reply
+    // plays 24kHz PCM at 48kHz — 2x speed, high-pitched. (Matches the Sat1 fix.)
+    audio::AudioStreamInfo input_stream_info(16, 1, 24000);  // 16-bit, mono, 24kHz (OpenAI output)
+    this->speaker_->set_audio_stream_info(input_stream_info);
     this->speaker_->start();
   }
   
