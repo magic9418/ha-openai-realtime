@@ -1205,6 +1205,16 @@ voice_assistant_websocket:
         id: media_mixing_input
         decibel_reduction: 20  # Lower media volume by 20dB when voice assistant is active
         duration: 0.0s
+    # Barge-in sensitivity, scoped to the session. The static probability_cutoff is a single knob
+    # forced to serve two opposite jobs: strict enough that idle ambience doesn't false-wake, loose
+    # enough to catch "Neo" through the AEC residual of Neo's own playback. 0.98 -> 0.90 fixed
+    # barge-in, 0.90 -> 0.96 fixed false wakes, and each broke the other.
+    # Splitting it by state removes the conflict: stay strict (0.96) while idle, drop to the
+    # known-good 0.90 only for the duration of a session — which is the only time barge-in can
+    # happen anyway, and when the mic is already open and streaming.
+    # micro_wake_word exposes no YAML action for this, but WakeWordModel::set_probability_cutoff
+    # is public and the cutoff is quantised as int(probability * 255): 0.90 -> 229, 0.96 -> 244.
+    - lambda: id(primary_wake_word).set_probability_cutoff(229);   # 0.90 — barge-in over playback
   on_disconnected:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # turn ended → idle (ring off), NOT not_ready (red). Red is reserved for WiFi-down.
     - script.execute: control_leds
@@ -1216,6 +1226,7 @@ voice_assistant_websocket:
         id: media_mixing_input
         decibel_reduction: 0
         duration: 1.0s
+    - lambda: id(primary_wake_word).set_probability_cutoff(244);   # back to strict 0.96 when idle
   on_stopped:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # turn ended → idle (ring off), NOT not_ready (red). Red is reserved for WiFi-down.
     - script.execute: control_leds
@@ -1224,6 +1235,7 @@ voice_assistant_websocket:
         id: media_mixing_input
         decibel_reduction: 0
         duration: 1.0s
+    - lambda: id(primary_wake_word).set_probability_cutoff(244);   # back to strict 0.96 when idle
   on_error:
     - if:
         condition:
@@ -1236,6 +1248,9 @@ voice_assistant_websocket:
               id: media_mixing_input
               decibel_reduction: 0
               duration: 1.0s
+    # Deliberately OUTSIDE the init guard above: a stranded loose cutoff means the device
+    # false-wakes on ambience forever, so restore it on every error path without exception.
+    - lambda: id(primary_wake_word).set_probability_cutoff(244);   # back to strict 0.96
   # Wake-word enrollment mode (docs/wakeword_flywheel_plan.md Phase 3). The C++ owns the
   # mic-pin + 15-min safety cap + WS-drop restore; the YAML just disarms/re-arms the wake
   # model so guided reps ("Neo, Neo, Neo...") don't self-trigger while streaming.
