@@ -1,16 +1,46 @@
 # Voice PE — deferred work & the wake-word blocker (2026-07-17)
 
-## ⚠️ PENDING FLASH (2026-08-02): code ahead of the device
+## ⚠️ PENDING FLASH (2026-08-23): code ahead of the device
 
-The following are committed to the PE firmware but **NOT yet flashed** to the office PE
-(192.168.5.29) — Matt is not working on the PE right now, applied for parity with the Sat1:
-- **Barge-in reply pitch fix** — `process_received_audio_` now re-asserts `set_audio_stream_info(24kHz)`
-  when restarting the speaker after a barge-in (else the follow-up reply plays 2× / high-pitched).
-- **Silent wake** — removed the wake chime (`play_sound(wake_word_triggered_sound)`); Neo wakes silent
-  on all HW per Matt's preference.
-- Already flashed earlier (2026-08-02): server-driven `auto_stop_inactivity_ms` parsed from the hello
-  frame. Sat1-only fixes (mic uplink 16k, red-LED no-HA check) do NOT apply to the PE.
-**Compiles clean.** Flash with `poetry run esphome upload voice_pe_config.yaml` (OTA to .29) when ready.
+Everything below is committed to the PE firmware but **NOT yet flashed** to the office PE
+(192.168.5.29). The office PE has been offline; this branch brings it to **Sat1 parity** so both
+rooms run the same voice behaviour.
+
+Ported from `satellite1-neo` on 2026-08-23 (`voice_assistant_websocket` is a shared lineage, so
+these are the Sat1 commits applied to the PE copy):
+- **Session auto-close with no reply** (Sat1 `221ad39`) — `running_since_` is the auto-stop
+  reference until the bot speaks. Before: a bare wake with no reply left the session open forever,
+  which then wedged the next wake ("WebSocket client already exists").
+- **Barge-in no longer auto-stops the session** (Sat1 `3b0d381`) — the interrupt path re-bases
+  `running_since_`, so saying "Neo" over a reply on a session older than `auto_stop_inactivity_ms`
+  no longer closes it the moment you stop talking.
+- **Mic look-back / pre-roll** (Sat1 `3e31cbd` + `1861537`) — a 1 s circular PSRAM ring filled
+  continuously while idle, flushed oldest-first at the wake, announced to the server as
+  `{"type":"preroll","ms":N}`. Fixes the run-together "Neo play some alternative music" losing
+  "play some" to micro_wake_word's detection latency. The server (jonnyAI `1aecbc6`) already
+  measures the wake instant on the audio timeline and needs this frame to place it.
+- **Server `{"type":"reboot"}` handler** (Sat1 `ff17435`) — present but **deliberately disabled**,
+  exactly as on the Sat1, so the Console's Reboot button is a no-op until that build is re-tested.
+
+Config-side parity, same date:
+- **`power_save_mode: none`** — the Sendspin PONG-deadline dropout fix (Sat1 `ce2a721`). The PE now
+  plays music through Sendspin, so it is exposed to the same ~15-min "player unavailable".
+- **Wake cutoff keyed on session OR playback** (Sat1 `f3caf6d`) — one `update_wake_sensitivity`
+  script replaces the inline per-hook lambdas, so the strict idle cutoff no longer applies while
+  music is playing with no session open.
+- **Build label** `project.version: neo-2026.08.23-sat1parity` — so "what is flashed?" is a log line.
+
+Still pending from 2026-08-02 (unchanged, also not flashed):
+- **Barge-in reply pitch fix** — `process_received_audio_` re-asserts `set_audio_stream_info(24kHz)`
+  when restarting the speaker after a barge-in.
+- **Silent wake** — the wake chime is gone; Neo wakes silent on all hardware.
+- **Sendspin / `speaker_source` migration** and the session-scoped wake cutoff.
+Already flashed earlier (2026-08-02): server-driven `auto_stop_inactivity_ms` from the hello frame.
+Sat1-only fixes (mic uplink 16k, red-LED no-HA check) do NOT apply to the PE.
+
+**Not compiled or flashed yet** — this port was written off-device. Build before flashing:
+`poetry run esphome compile voice_pe_config.yaml`, then
+`poetry run esphome upload voice_pe_config.yaml` (OTA to .29).
 
 ---
 

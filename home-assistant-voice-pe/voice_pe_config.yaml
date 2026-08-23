@@ -64,6 +64,12 @@ esphome:
   friendly_name: Home Assistant OpenAI Realtime Voice
   name_add_mac_suffix: true
   min_version: 2025.11.0
+  # Build label — printed at boot and exposed as device info, so "what is actually flashed on the
+  # office PE?" is answerable from a log line instead of guesswork. Bump it with every flash; the
+  # Sat1 does the same via `esp32_fw_version` (satellite1-neo config/neo_satellite1.yaml).
+  project:
+    name: neo.voice_pe
+    version: neo-2026.08.23-sat1parity
   on_boot:
     priority: 375
     then:
@@ -104,6 +110,14 @@ esp32:
 
 wifi:
   id: wifi_id
+  # NEO 2026-08-23: disable WiFi modem-sleep, matching the Sat1 (satellite1-neo
+  # config/common/wifi_improv.yaml). ESPHome's ESP-IDF default is power_save_mode: LIGHT — the radio
+  # sleeps between DTIM beacons, which left the Sendspin websocket PING unread until the next beacon
+  # wake; under audio + wake-DSP CPU pressure that missed aiosendspin's 15s PONG deadline and MA
+  # marked the player unavailable every ~15 min. The PE now plays music through Sendspin too
+  # (speaker_source migration), so it is exposed to exactly the same dropout. NONE keeps the radio
+  # awake; the idle-power cost is irrelevant on a mains-powered PE.
+  power_save_mode: none
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   fast_connect: false
@@ -930,6 +944,24 @@ script:
           value: 0
       - script.execute: control_leds
 
+  # NEO 2026-08-23 (Sat1 parity): the wake cutoff is state-derived, not set inline at each hook.
+  # Session-scoping alone left the STRICT idle cutoff in force while music was playing with no
+  # session open — which is exactly when the room is loudest and the AEC residual is worst, so you
+  # had to turn the music down to be heard. Keying on playback as well fixes that. Evaluated at the
+  # session hooks below (music always starts from a session, so the session-end run catches it).
+  #
+  # micro_wake_word exposes no YAML action for this; WakeWordModel::set_probability_cutoff is
+  # public and the value quantises as int(probability * 255) — 0.90 = 229, 0.96 = 244.
+  - id: update_wake_sensitivity
+    then:
+      - lambda: |-
+          const bool session = id(voice_assistant_ws).is_running();
+          // voice_media_player is the pipeline Sendspin audio actually flows through
+          // (sendspin_group_media_player is controller-facing only and holds no speaker).
+          const bool playing = id(voice_media_player).state ==
+                               media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING;
+          id(primary_wake_word).set_probability_cutoff((session || playing) ? 229 : 244);
+
   # NEO (Stage B): the `play_sound` script was removed here. It was already dead code — its only
   # caller was the wake chime, dropped when Neo went silent-on-wake — and it called
   # `play_file(audio::AudioFile*)`, an API of the old `speaker` media_player platform that
@@ -1214,7 +1246,7 @@ voice_assistant_websocket:
     # happen anyway, and when the mic is already open and streaming.
     # micro_wake_word exposes no YAML action for this, but WakeWordModel::set_probability_cutoff
     # is public and the cutoff is quantised as int(probability * 255): 0.90 -> 229, 0.96 -> 244.
-    - lambda: id(primary_wake_word).set_probability_cutoff(229);   # 0.90 — barge-in over playback
+    - script.execute: update_wake_sensitivity   # 0.90 while a session is open (barge-in over playback)
   on_disconnected:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # turn ended → idle (ring off), NOT not_ready (red). Red is reserved for WiFi-down.
     - script.execute: control_leds
@@ -1226,7 +1258,7 @@ voice_assistant_websocket:
         id: media_mixing_input
         decibel_reduction: 0
         duration: 1.0s
-    - lambda: id(primary_wake_word).set_probability_cutoff(244);   # back to strict 0.96 when idle
+    - script.execute: update_wake_sensitivity   # back to strict 0.96 — unless music is still playing
   on_stopped:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # turn ended → idle (ring off), NOT not_ready (red). Red is reserved for WiFi-down.
     - script.execute: control_leds
@@ -1235,7 +1267,7 @@ voice_assistant_websocket:
         id: media_mixing_input
         decibel_reduction: 0
         duration: 1.0s
-    - lambda: id(primary_wake_word).set_probability_cutoff(244);   # back to strict 0.96 when idle
+    - script.execute: update_wake_sensitivity   # back to strict 0.96 — unless music is still playing
   on_error:
     - if:
         condition:
@@ -1250,7 +1282,7 @@ voice_assistant_websocket:
               duration: 1.0s
     # Deliberately OUTSIDE the init guard above: a stranded loose cutoff means the device
     # false-wakes on ambience forever, so restore it on every error path without exception.
-    - lambda: id(primary_wake_word).set_probability_cutoff(244);   # back to strict 0.96
+    - script.execute: update_wake_sensitivity   # back to strict 0.96 — unless music is still playing
   # Wake-word enrollment mode (docs/wakeword_flywheel_plan.md Phase 3). The C++ owns the
   # mic-pin + 15-min safety cap + WS-drop restore; the YAML just disarms/re-arms the wake
   # model so guided reps ("Neo, Neo, Neo...") don't self-trigger while streaming.
