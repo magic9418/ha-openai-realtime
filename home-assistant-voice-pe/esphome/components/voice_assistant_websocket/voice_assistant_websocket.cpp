@@ -3,6 +3,7 @@
 #include "esphome/core/helpers.h"
 #include "esphome/components/audio/audio.h"
 #include "esphome/core/hal.h"
+#include "esphome/core/application.h"  // App.safe_reboot() for server-requested reboot
 #include <cstring>
 #include <algorithm>
 #include <queue>
@@ -24,6 +25,7 @@ void VoiceAssistantWebSocket::setup() {
   this->resampled_buffer_.reserve(INPUT_BUFFER_SIZE * 3 / 2); // 1.5x upsampling for 16kHz -> 24kHz
   this->output_stereo_buffer_.reserve(4096 * 2);  // Reserve for output processing (24kHz mono -> 48kHz stereo)
   this->audio_ring_init_();  // pre-allocate the PSRAM audio backlog ring (see header)
+  this->preroll_init_();     // pre-allocate the PSRAM mic look-back (front-of-command clip fix)
   this->state_ = VOICE_ASSISTANT_WEBSOCKET_IDLE;
   
   // Register microphone data callback
@@ -35,6 +37,16 @@ void VoiceAssistantWebSocket::setup() {
 }
 
 void VoiceAssistantWebSocket::loop() {
+  // Handle pending reboot (must be done in main task, not websocket task). Set by the WS
+  // text-frame handler on a server {"type":"reboot"} frame. App.safe_reboot() flushes
+  // preferences and shuts components down cleanly, then resets the chip; it does not return.
+  if (this->pending_reboot_) {
+    this->pending_reboot_ = false;
+    ESP_LOGW(TAG, "Server-requested reboot - rebooting now");
+    App.safe_reboot();
+    return;  // safe_reboot() does not return; guard anyway.
+  }
+
   // Handle pending disconnect (must be done in main task, not websocket task)
   if (this->pending_disconnect_) {
     this->pending_disconnect_ = false;
@@ -91,23 +103,25 @@ void VoiceAssistantWebSocket::loop() {
   // - If user speaks, OpenAI will generate new audio, which resets the timer
   if (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
     uint32_t current_time = millis();
-    uint32_t time_since_speaker_audio = current_time - this->last_speaker_audio_time_;
-    
-    // Only check if we've received at least one audio chunk (to avoid stopping immediately)
-    if (this->last_speaker_audio_time_ > 0) {
-      // Stop if speaker hasn't spoken for 5 seconds
-      // If user speaks during this time, OpenAI will generate new audio, resetting the timer
-      if (time_since_speaker_audio > this->auto_stop_inactivity_ms_) {
-        ESP_LOGI(TAG, "Auto-stopping: Speaker inactive for %u ms (threshold: %u ms)",
-                 time_since_speaker_audio, this->auto_stop_inactivity_ms_);
-        // Timer/auto-stop close: drop any half-sentence still sitting in the server's
-        // input buffer *at the cut-off source* so a later wake can't "complete" it.
-        // Only on this timer path — NOT on user-interrupt or wake (per the guards plan;
-        // a reactive clear-on-wake disturbs the server VAD). Sent while still connected,
-        // before stop() tears the WS down.
-        this->send_text_frame_("{\"type\":\"mic_flush\"}");
-        this->stop();
-      }
+    // Inactivity reference: last speaker audio once the bot has spoken, else the moment the session
+    // went RUNNING. The old code only armed the timer after the FIRST audio chunk, so a bare wake
+    // with no reply (you say "Neo" then nothing, or the model returns empty) left the session open
+    // forever — which then wedges the next wake ("WebSocket client already exists"). Using
+    // running_since_ as the fallback makes a silent session auto-close after the same timeout.
+    uint32_t inactivity_ref =
+        (this->last_speaker_audio_time_ > 0) ? this->last_speaker_audio_time_ : this->running_since_;
+
+    if (inactivity_ref > 0 && (current_time - inactivity_ref) > this->auto_stop_inactivity_ms_) {
+      ESP_LOGI(TAG, "Auto-stopping: inactive for %u ms (threshold: %u ms, bot_spoke=%s)",
+               current_time - inactivity_ref, this->auto_stop_inactivity_ms_,
+               this->last_speaker_audio_time_ > 0 ? "yes" : "no");
+      // Timer/auto-stop close: drop any half-sentence still sitting in the server's
+      // input buffer *at the cut-off source* so a later wake can't "complete" it.
+      // Only on this timer path — NOT on user-interrupt or wake (per the guards plan;
+      // a reactive clear-on-wake disturbs the server VAD). Sent while still connected,
+      // before stop() tears the WS down.
+      this->send_text_frame_("{\"type\":\"mic_flush\"}");
+      this->stop();
     }
   }
   
@@ -147,6 +161,10 @@ void VoiceAssistantWebSocket::start() {
 
   // Reset auto-stop tracking
   this->last_speaker_audio_time_ = 0;
+
+  // Do NOT reset the mic look-back here. start() is the wake instant, and the audio we are trying to
+  // rescue was spoken BEFORE it — inside micro_wake_word's detection latency. The ring has been
+  // filling all along while idle and already holds it; clearing here would throw away the fix.
 
   // Arm the mic-forward gate for the wake chime. The YAML now calls start() BEFORE the chime, so
   // connect_websocket_() runs underneath the chime instead of after it — the mic opens ~this delay
@@ -205,6 +223,10 @@ void VoiceAssistantWebSocket::stop() {
   ESP_LOGD(TAG, "Keeping microphone running for micro_wake_word");
   // Stop speaker + empty the backlog ring atomically (serialized against the main-task drain).
   this->audio_ring_flush_and_stop_speaker_();
+  // Drop the look-back: it belongs to a session that is ending (and its tail is Neo's own reply
+  // bleeding into the mic). Leaving it would prepend that onto the NEXT wake's uplink. Idle frames
+  // refill the ring within PREROLL_MS, well before anyone can say "Neo" again.
+  this->preroll_reset_();
 
   if (this->state_callback_) {
     this->state_callback_(this->state_);
@@ -387,6 +409,82 @@ void VoiceAssistantWebSocket::process_received_audio_(const uint8_t *data, size_
 }
 
 // ---- PSRAM audio backlog ring buffer (see header) ----------------------------------------
+// ---- Mic look-back: the PREROLL_MS of room audio preceding the wake -------------------------
+// Circular, and filled continuously while idle. A buffer armed by start() cannot fix the clip;
+// see the header for why (the lost words are spoken before the wake fires).
+void VoiceAssistantWebSocket::preroll_init_() {
+  if (this->preroll_ != nullptr) return;
+#ifdef USE_ESP_IDF
+  this->preroll_ = static_cast<uint8_t *>(heap_caps_malloc(PREROLL_CAPACITY, MALLOC_CAP_SPIRAM));
+  if (this->preroll_ == nullptr) {
+    ESP_LOGE(TAG, "PSRAM look-back alloc failed (%zu bytes); trying internal", PREROLL_CAPACITY);
+    this->preroll_ = static_cast<uint8_t *>(heap_caps_malloc(PREROLL_CAPACITY, MALLOC_CAP_8BIT));
+  }
+#else
+  this->preroll_ = static_cast<uint8_t *>(malloc(PREROLL_CAPACITY));
+#endif
+  if (this->preroll_ == nullptr) {
+    ESP_LOGE(TAG, "Look-back allocation failed — the front of commands will be clipped again");
+  }
+  this->preroll_reset_();
+}
+
+// Circular write. Overwriting the oldest byte is the POINT — we always want the most recent
+// PREROLL_MS, so a full ring is the steady state, not an overflow condition.
+void VoiceAssistantWebSocket::preroll_push_(const uint8_t *data, size_t len) {
+  if (this->preroll_ == nullptr || len == 0) return;
+  if (len >= PREROLL_CAPACITY) {              // one chunk bigger than the ring: keep only its tail
+    memcpy(this->preroll_, data + (len - PREROLL_CAPACITY), PREROLL_CAPACITY);
+    this->preroll_head_ = 0;
+    this->preroll_fill_ = PREROLL_CAPACITY;
+    return;
+  }
+  size_t first = PREROLL_CAPACITY - this->preroll_head_;   // room before the wrap
+  if (first > len) first = len;
+  memcpy(this->preroll_ + this->preroll_head_, data, first);
+  if (len > first) {
+    memcpy(this->preroll_, data + first, len - first);     // remainder at the bottom
+  }
+  this->preroll_head_ = (this->preroll_head_ + len) % PREROLL_CAPACITY;
+  this->preroll_fill_ =
+      (this->preroll_fill_ + len > PREROLL_CAPACITY) ? PREROLL_CAPACITY : this->preroll_fill_ + len;
+}
+
+void VoiceAssistantWebSocket::preroll_flush_() {
+  if (this->preroll_ == nullptr || this->preroll_fill_ == 0) return;
+  size_t total = this->preroll_fill_;
+  // Oldest byte sits `total` behind the write cursor, modulo the ring.
+  size_t start = (this->preroll_head_ + PREROLL_CAPACITY - total) % PREROLL_CAPACITY;
+  // Clear FIRST: send_audio_chunk_ can block, and re-entering here with a non-zero fill would
+  // double-send the look-back.
+  this->preroll_fill_ = 0;
+  this->preroll_head_ = 0;
+  uint32_t ms = (uint32_t) (total / BYTES_PER_MS_24K);
+  ESP_LOGI(TAG, "Flushing %zu B look-back (%u ms of pre-wake mic audio)", total, (unsigned) ms);
+  // Tell the server how much PRE-wake audio it is about to receive. Guard B asks "did the user speak
+  // AFTER the wake?"; without this it would see speech begin the instant the socket opens — that is
+  // the wake word itself, now sitting at the front of this flush — and either cancel a real command
+  // or wave through a bare false wake. The server subtracts this to locate the wake instant in the
+  // audio timeline. Sent BEFORE the audio so it can never arrive late.
+  char buf[48];
+  snprintf(buf, sizeof(buf), "{\"type\":\"preroll\",\"ms\":%u}", (unsigned) ms);
+  this->send_text_frame_(buf);
+  for (size_t sent = 0; sent < total; ) {
+    size_t idx = (start + sent) % PREROLL_CAPACITY;
+    size_t n = (total - sent) < PREROLL_CHUNK ? (total - sent) : PREROLL_CHUNK;
+    if (idx + n > PREROLL_CAPACITY) {
+      n = PREROLL_CAPACITY - idx;             // never span the wrap in a single send
+    }
+    this->send_audio_chunk_(this->preroll_ + idx, n);
+    sent += n;
+  }
+}
+
+void VoiceAssistantWebSocket::preroll_reset_() {
+  this->preroll_fill_ = 0;
+  this->preroll_head_ = 0;
+}
+
 void VoiceAssistantWebSocket::audio_ring_init_() {
   if (this->audio_ring_ != nullptr) return;
 #ifdef USE_ESP_IDF
@@ -485,15 +583,22 @@ void VoiceAssistantWebSocket::report_audio_free_(bool force) {
 }
 
 void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &data) {
-  // Only process if connected. Normally we stream only during a RUNNING session — BUT during
+  // Only stream if connected. Normally we stream only during a RUNNING session — BUT during
   // enrollment ("teach me my voice") there is no wake-session: the mic is pinned open with wake
   // disarmed, and the server needs every rep frame to build the training WAV. Without the
   // `enrolling_` exception the enrollment recorder captured ~nothing (empty WAVs).
-  if (!this->is_connected() ||
-      (this->state_ != VOICE_ASSISTANT_WEBSOCKET_RUNNING && !this->enrolling_)) {
+  const bool live = this->is_connected() &&
+                    (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING || this->enrolling_);
+  // LOOK-BACK (front-of-command clip). When not live we no longer return early — we keep the most
+  // recent PREROLL_MS in a ring so that a run-together "Neo play some alternative music" survives
+  // micro_wake_word's detection latency. Those frames are already being delivered here (the callback
+  // is registered unconditionally in setup() and mww keeps the mic running); we just used to drop
+  // them. Enrollment is excluded: it has no wake, and its own live path already streams every frame.
+  if (!live && this->enrolling_) {
     return;
   }
-  
+
+
   // Barge-in policy (see NEO_FULL_DUPLEX_BARGEIN in the header):
   //  * DEFAULT (half-duplex): don't stream the mic while Neo is speaking, so room cross-talk /
   //    echo isn't committed as user input. Full-duplex flooded noisy rooms with phantom turns
@@ -505,6 +610,11 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   // Enrollment pins the mic open regardless of this guard.
 #if !NEO_FULL_DUPLEX_BARGEIN
   if (this->is_bot_speaking() && !this->enrolling_) {
+    // Contiguity invariant (see header): a dropped frame breaks the ring's "recent, continuous room
+    // audio" guarantee, so clear it. This is also what keeps Neo's OWN reply out of the look-back —
+    // is_bot_speaking() stays true for a beat after stop(), which is exactly when the speaker is
+    // still sounding into the mic. Without this, the next wake would prepend Neo talking to itself.
+    this->preroll_reset_();
     return;
   }
 #endif
@@ -512,7 +622,9 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   // Wake-chime gate: drop uplink for the wake-open window after a wake so the chime doesn't bleed
   // into ASR. The WS connect overlaps this window, so the mic opens ~wake_open_delay_ms after wake
   // (not chime + delay + connect). Enrollment pins the mic open regardless.
-  if (!this->enrolling_ && this->mic_gate_until_ != 0) {
+  // (Only while live — by the time we are live the look-back has already been flushed, so this gate
+  // can no longer eat the front of a command.)
+  if (live && !this->enrolling_ && this->mic_gate_until_ != 0) {
     if ((int32_t)(millis() - this->mic_gate_until_) < 0) {
       return;
     }
@@ -564,6 +676,18 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   }
   
   size_t resampled_bytes = resampled_24khz_samples * BYTES_PER_SAMPLE;
+
+  if (!live) {
+    // Idle or still connecting — keep the rolling PREROLL_MS instead of dropping.
+    this->preroll_push_(reinterpret_cast<const uint8_t *>(resampled_24khz), resampled_bytes);
+    return;
+  }
+  // First live frame after a connect: emit the look-back (pre-wake audio through the connect), in
+  // order, BEFORE this chunk. Done here on the mic task rather than in the WS event handler so all
+  // sends stay on one task and the stream can't interleave out of order.
+  if (this->preroll_fill_ > 0) {
+    this->preroll_flush_();
+  }
   this->send_audio_chunk_(reinterpret_cast<const uint8_t *>(resampled_24khz), resampled_bytes);
 }
 
@@ -659,8 +783,17 @@ void VoiceAssistantWebSocket::interrupt() {
     // Open the mic for the follow-up NOW: clear last_speaker_audio_time_ so is_bot_speaking()
     // (the half-duplex guard) reads false immediately instead of staying true ~500ms after the
     // last server frame — that lingering guard ate the front of the barge-in follow-up command.
-    // (Consistent with start(), which also zeroes it to re-arm auto-stop for the fresh turn.)
     this->last_speaker_audio_time_ = 0;
+    // ...but last_speaker_audio_time_ is ALSO the auto-stop inactivity reference (see loop()), and
+    // zeroing it falls back to running_since_ — the moment the session started, which by now is
+    // long past. On any session older than auto_stop_inactivity_ms that made loop() auto-stop
+    // IMMEDIATELY on barge-in: "Neo" over a reply killed the session before the follow-up command
+    // could be spoken. (Symptom: 1st barge-in works, the 2nd/3rd — once the session has been alive
+    // >15 s, e.g. after a long calendar readout — drops the moment you finish talking.)
+    // start() gets away with the same zeroing only because it sets running_since_ fresh too.
+    // Re-base it here for the same reason: post-barge-in we're waiting on a new user command with
+    // no reply audio yet — exactly the "fresh turn" state running_since_ is meant to time.
+    this->running_since_ = millis();
     // But still gate the barge-in chime out of ASR for the wake-open window.
     this->mic_gate_until_ = millis() + this->wake_open_delay_ms_;
     // Set interrupt time to ignore incoming audio for a short period
@@ -691,6 +824,7 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
     case WEBSOCKET_EVENT_CONNECTED:
       ESP_LOGI(TAG, "WebSocket connected");
       this->state_ = VOICE_ASSISTANT_WEBSOCKET_RUNNING;
+      this->running_since_ = millis();  // start the inactivity clock even if the bot never speaks
       this->reconnect_attempts_ = 0;
       this->reconnect_pending_ = false;
       this->last_audio_send_ = millis();
@@ -755,6 +889,19 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
           this->explicit_disconnect_ = true;
           // Stop the voice assistant (will go to idle mode)
           this->stop();
+        } else if (message.find("\"type\":\"reboot\"") != std::string::npos ||
+                   message.find("\"type\": \"reboot\"") != std::string::npos) {
+          // Server-requested device reboot (Console "Reboot" button -> session-server
+          // /reboot_device -> {"type":"reboot"} down this WS). Cannot reboot from the
+          // websocket task; defer to loop() (main task) via pending_reboot_, mirroring the
+          // pending_disconnect_ pattern above.
+          //
+          // DISABLED to match the Sat1 build. The Sat1 left it off so a firmware flash carrying
+          // other fixes wasn't testing two variables at once; keeping the PE identical means the
+          // Console's Reboot button is a no-op on BOTH devices rather than one of each. Re-arm the
+          // two together when that decision is made (docs/STATE.md "Console Reboot button").
+          ESP_LOGW(TAG, "reboot requested by server [handler present but disabled]");
+          // this->pending_reboot_ = true;  // DISABLED: re-arm to enable the Console Reboot button
         } else if (message.find("\"type\":\"hello\"") != std::string::npos ||
                    message.find("\"type\": \"hello\"") != std::string::npos) {
           // Server → firmware config on WS open. Parse wake_open_delay_ms and store it so

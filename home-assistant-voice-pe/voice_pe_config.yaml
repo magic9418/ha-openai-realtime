@@ -107,6 +107,13 @@ wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   fast_connect: false
+  # Disable WiFi modem-sleep. ESPHome defaults to power_save_mode: LIGHT, which parks the radio
+  # between DTIM beacons; the Sendspin music stream's aiohttp heartbeat (hardcoded 30 s in
+  # aiosendspin, so its PONG deadline is 15 s and NOT a Music Assistant knob) then misses its
+  # deadline and Music Assistant marks the player unavailable — music dropped every ~15 min on the
+  # Sat1s for exactly this reason. Tell: the cadence is regular and it fires even with no music
+  # playing. Same fix already flashed to the kitchen Sat1 (common/wifi_improv.yaml).
+  power_save_mode: none
   on_connect:
     - lambda: id(improv_ble_in_progress) = false;
     - script.execute: control_leds

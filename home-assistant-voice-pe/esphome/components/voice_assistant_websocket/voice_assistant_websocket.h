@@ -169,9 +169,41 @@ class VoiceAssistantWebSocket : public Component {
   static const uint32_t OUTPUT_SAMPLE_RATE = 24000;    // 24kHz for OpenAI output
   static const uint32_t BYTES_PER_SAMPLE = 2;          // 16-bit = 2 bytes
   static const uint32_t INPUT_BUFFER_SIZE = (INPUT_SAMPLE_RATE * BYTES_PER_SAMPLE * AUDIO_SEND_INTERVAL_MS) / 1000;
-  
+
+  // Mic LOOK-BACK — the uplink counterpart of the assistant-audio ring above (ported from Sat1,
+  // 2026-08-21).
+  //
+  // A buffer armed by start() cannot fix the front-of-command clip: micro_wake_word can only report
+  // "Neo" once the whole word has passed through its sliding window, so start() runs a few hundred ms
+  // AFTER the user finished saying it. In a run-together "Neo play some alternative music" the words
+  // "play some" are spoken INSIDE that detection latency — before start(). Nor can wake_open_delay_ms
+  // help: every one of these gates sits downstream of a wake that has, by construction, already
+  // happened.
+  //
+  // So this is a CIRCULAR look-back that fills continuously while idle (the mic callback is
+  // registered unconditionally in setup() and micro_wake_word keeps the mic running, so the frames
+  // are already arriving — we simply used to discard them). At the wake we already hold the preceding
+  // PREROLL_MS, wake word and all, and flush it oldest-first ahead of the live stream.
+  //
+  // INVARIANT: the ring holds only CONTIGUOUS, recently-heard room audio. Every path that drops a
+  // frame (bot speaking, mic gate) resets it, so a flush can never prepend Neo's own reply echo or
+  // a stale fragment from minutes ago onto the next command.
+  static const uint32_t PREROLL_MS = 1000;                     // look-back depth: wake word + detection latency
+  static const uint32_t BYTES_PER_MS_24K = (INPUT_SAMPLE_RATE * BYTES_PER_SAMPLE) / 1000;  // 48 B/ms
+  static const size_t PREROLL_CAPACITY = PREROLL_MS * BYTES_PER_MS_24K;                    // 48 KB
+  static const size_t PREROLL_CHUNK = INPUT_BUFFER_SIZE;       // flush in normal-sized frames
+  uint8_t *preroll_{nullptr};
+  size_t preroll_fill_{0};            // bytes held (saturates at PREROLL_CAPACITY)
+  size_t preroll_head_{0};            // write cursor; once full this is also the OLDEST byte
+  void preroll_init_();
+  void preroll_push_(const uint8_t *data, size_t len);
+  void preroll_flush_();
+  void preroll_reset_();
+
   // Auto-stop tracking
   uint32_t last_speaker_audio_time_{0};  // Last time we received audio from speaker
+  uint32_t running_since_{0};  // millis() the session went RUNNING; auto-stop reference when the bot
+                               // hasn't spoken yet, so a bare wake with no reply still auto-closes.
   // Stop after N ms of speaker (bot) inactivity. Configurable via the
   // `auto_stop_inactivity_ms` YAML option; default set here matches the schema default.
   uint32_t auto_stop_inactivity_ms_{120000};
@@ -183,6 +215,7 @@ class VoiceAssistantWebSocket : public Component {
   
   bool pending_start_{false};
   bool pending_disconnect_{false};  // Flag to disconnect in loop() (cannot be called from websocket task)
+  bool pending_reboot_{false};  // Flag to reboot in loop() (server {"type":"reboot"} frame; cannot reboot from websocket task)
   bool reconnect_pending_{false};
   bool explicit_disconnect_{false};  // Flag to prevent reconnection after explicit disconnect
   uint32_t reconnect_attempts_{0};
