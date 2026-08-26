@@ -1122,6 +1122,21 @@ micro_wake_word:
       # trade-off is slightly more idle false-wakes (the flywheel + this knob manage it — raise toward
       # 0.95 if false triggers get annoying, lower toward 0.85 if barge-in is still stubborn).
       # 2026-08-01: raised to 0.96 — device was over-sensitive (too many idle false-wakes).
+      #
+      # 2026-08-26: STOP TUNING THIS KNOB FOR FALSE WAKES. The detection rule is
+      #   detected = sum(recent_probabilities) > probability_cutoff * sliding_window_size
+      # (streaming_model.cpp determine_detected) — i.e. the MEAN probability across the last N
+      # windows. That is two independent axes, and every fix so far has fought over just this one:
+      # 0.98 -> 0.90 fixed barge-in and broke idle, 0.90 -> 0.96 fixed idle and broke barge-in.
+      # 3c50006 finally split it by SESSION STATE, which is why this is still 0.96 while idle.
+      # The other axis — how SUSTAINED the detection must be — had never been touched:
+      # sliding_window_size was 5, and at feature_step_size 10 that is only ~50 ms of agreement,
+      # so any brief phonetic collision in ordinary conversation can pull the mean over. A spoken
+      # "Neo" lasts ~350-400 ms. Raised to 12 (~120 ms) in wake_words/neo.json instead, which
+      # suppresses transient trips WITHOUT raising the confidence bar, so it should not re-break
+      # barge-in the way every cutoff change did. Caveat: a longer window also averages in more
+      # non-word frames at the word edges, dragging the mean down slightly — so it is close to,
+      # but not perfectly, orthogonal. If barge-in regresses, back the WINDOW off before the cutoff.
       probability_cutoff: 0.96
     # Extra triggers disabled for the Neo build — uncomment to also wake on these:
     # - model: hey_jarvis
