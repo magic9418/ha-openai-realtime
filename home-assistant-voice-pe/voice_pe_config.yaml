@@ -1133,10 +1133,18 @@ micro_wake_word:
       # sliding_window_size was 5, and at feature_step_size 10 that is only ~50 ms of agreement,
       # so any brief phonetic collision in ordinary conversation can pull the mean over. A spoken
       # "Neo" lasts ~350-400 ms. Raised to 12 (~120 ms) in wake_words/neo.json instead, which
-      # suppresses transient trips WITHOUT raising the confidence bar, so it should not re-break
-      # barge-in the way every cutoff change did. Caveat: a longer window also averages in more
-      # non-word frames at the word edges, dragging the mean down slightly — so it is close to,
-      # but not perfectly, orthogonal. If barge-in regresses, back the WINDOW off before the cutoff.
+      # suppresses transient trips WITHOUT raising the confidence bar.
+      #
+      # 2026-08-27: 12 OVERSHOT — flashed, and the PE then "almost never" heard a deliberate "Neo"
+      # (false wakes stopped too; it suppressed everything). The caveat above was the right worry
+      # with the wrong magnitude, and the error is in the sizing rule: what has to fit inside the
+      # window is NOT the length of the spoken word, it is the length of the model's CONFIDENCE
+      # PEAK, which is much shorter. At 12 the window averages that peak together with the
+      # low-probability frames on either side, so the mean never clears 0.96 even on a clean wake.
+      # Backed off to 8 (~80 ms) — still 60% more sustain than the original 5, but sized against
+      # the peak rather than the word. The kitchen Sat1 runs 5 and wakes reliably, so 5 is the
+      # known-good floor to fall back to if 8 is still deaf. Do NOT answer a deaf window by
+      # lowering the cutoff — that re-enters the yo-yo this whole comment exists to end.
       probability_cutoff: 0.96
     # Extra triggers disabled for the Neo build — uncomment to also wake on these:
     # - model: hey_jarvis
