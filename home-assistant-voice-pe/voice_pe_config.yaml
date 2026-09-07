@@ -40,12 +40,14 @@ substitutions:
   # Server URL is now defined in secrets.yaml as server_url
   # Sound file for wake word (local file)
   wake_word_triggered_sound_file: wake_sound.flac
-  # Chime->start-of-forwarding delay (echo guard): the wake chime's DAC tail plays out
-  # before mic frames are forwarded, so the chime never gets answered. 320ms matches the
-  # session-server audio_prime_ms neighborhood. Server can override this at runtime via the
-  # {"type":"hello","wake_open_delay_ms":N} frame — see the commented server-driven variant
-  # in micro_wake_word.on_wake_word_detected below (voice_assistant_websocket guards plan).
-  wake_open_delay_ms: 320ms
+  # NOTE: there used to be a `wake_open_delay_ms: 320ms` substitution here. It was never actually
+  # referenced by any component field (dead — `grep '\${wake_open_delay_ms}'` turns up nothing),
+  # so it could silently drift from the value that's actually live and mislead anyone tuning this.
+  # The real mic-open delay is a single knob: the component's compiled-in default (see the C++
+  # header — flag any mismatch there to the C++ agent) UNLESS overridden at runtime by the
+  # session-server's `{"type":"hello","wake_open_delay_ms":N}` frame
+  # (SESSION_WAKE_OPEN_DELAY_MS in session_server/settings.py, currently 200). Tune it there, not
+  # in this YAML.
   # Primary wake word model. Change this in one place to swap the wake word.
   # Accepts either:
   #   - a microWakeWord v2 shorthand name (okay_nabu, hey_jarvis, hey_mycroft, hey_rhasspy)
@@ -175,6 +177,15 @@ globals:
     initial_value: 'true'
   # Global variable storing the state of ImprovBLE
   - id: improv_ble_in_progress
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Wake-word enrollment in progress (docs/wakeword_flywheel_plan.md Phase 3). Set/cleared by
+  # on_enroll_start/on_enroll_stop below. Read by the mww watchdog interval so it doesn't
+  # re-arm micro_wake_word mid-enrollment (on_enroll_start deliberately stops mww so guided
+  # reps don't self-trigger; without this flag the 30s watchdog reads that as "mww not
+  # running while idle+unmuted" and restarts it out from under the enrollment).
+  - id: wake_enrolling
     type: bool
     restore_value: no
     initial_value: 'false'
@@ -1171,9 +1182,11 @@ micro_wake_word:
                 - voice_assistant_websocket.interrupt:
                     id: voice_assistant_ws
           # Cold wake: START the session BEFORE the chime, so the WS connect runs *underneath* the
-          # chime instead of after it. The mic then opens ~wake_open_delay_ms after wake (the
-          # component's mic-gate covers the chime), not chime + delay + connect — which used to eat
-          # the front of your first command. A mid-session re-wake stays open (handled above).
+          # chime instead of after it. The mic then opens after wake per the component's own
+          # mic-open delay (compiled-in default, overridable at runtime by the session-server's
+          # `hello` frame — see the substitutions block above), not chime + delay + connect — which
+          # used to eat the front of your first command. A mid-session re-wake stays open (handled
+          # above).
           - if:
               condition:
                 not:
@@ -1285,12 +1298,14 @@ voice_assistant_websocket:
   # mic-pin + 15-min safety cap + WS-drop restore; the YAML just disarms/re-arms the wake
   # model so guided reps ("Neo, Neo, Neo...") don't self-trigger while streaming.
   on_enroll_start:
+    - lambda: id(wake_enrolling) = true;
     - logger.log:
         format: "Enrollment start - stopping micro_wake_word so reps don't self-trigger"
         level: INFO
     - micro_wake_word.stop:
         id: mww
   on_enroll_stop:
+    - lambda: id(wake_enrolling) = false;
     - logger.log:
         format: "Enrollment stop - re-arming micro_wake_word"
         level: INFO
@@ -1357,6 +1372,7 @@ interval:
           condition:
             and:
               - lambda: "return !id(init_in_progress);"
+              - lambda: "return !id(wake_enrolling);"
               - switch.is_off: master_mute_switch
               - not:
                   micro_wake_word.is_running:
@@ -1368,8 +1384,14 @@ interval:
                 id: mww
 
 time:
-  # HA supplies the clock (api is already connected) — no internet/SNTP needed.
-  - platform: homeassistant
+  # NOT `platform: homeassistant` — this device is standalone (see the `api:` block above:
+  # "not managed by Home Assistant", only client is `esphome logs`). The homeassistant time
+  # platform is pushed by a genuine HA connection; with none, `ha_time` never syncs and the
+  # 04:00 nightly reboot below never fires. sntp needs only WiFi + internet, both already
+  # present. NOTE: no `timezone:` is set here — ESPHome falls back to auto-detecting it at
+  # compile time, which is unreliable if the build runs off-site (e.g. CI); pin an explicit
+  # `timezone:` string here if the 04:00 firing time turns out wrong.
+  - platform: sntp
     id: ha_time
     on_time:
       # 04:00 local: reboot to clear heap, but only if no voice session is open.

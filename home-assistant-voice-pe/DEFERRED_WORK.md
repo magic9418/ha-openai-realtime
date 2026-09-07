@@ -1,9 +1,19 @@
 # Voice PE — deferred work & the wake-word blocker (2026-07-17)
 
-## ⚠️ PENDING FLASH (2026-08-23): code ahead of the device
+## ✅ FLASHED 2026-08-23 (Sat1-parity set) — later wake-tuning commits: verify before assuming
 
-Five commits are on `feat/wake-guards-flywheel` but **NOT yet flashed** to the office PE
-(192.168.5.29), which is still on the 2026-08-02 build.
+The five commits below (the 2026-08-23 "Sat1 parity" set) **were flashed** to the office PE
+(192.168.5.29) on 2026-08-23 — this section used to say "NOT yet flashed, still on the 2026-08-02
+build"; that was true when written and is stale now. Web-flash by preference, not OTA.
+
+**Two more wake-tuning commits landed on this branch after that flash** and their on-device status
+was NOT re-verified for this doc pass: `292e53f` (2026-08-26, raised `sliding_window_size` 5→12 —
+this is the change that made the device deaf) and `277d0e6` (2026-08-27, reverted it back to 8).
+Per the pinned wake-sliding-window-sizing note, 8 is the current known-good value, so if the device
+is behaving normally it's almost certainly on 277d0e6 or later — but don't take this doc's word for
+either direction. **Check the device's reported build/version at boot (`esphome logs
+voice_pe_config.yaml`) against `git log --oneline -- voice_pe_config.yaml` before assuming what's
+flashed**, the same trap this section fell into the first time.
 
 **Web-flash image built 2026-08-23** (flash at offset `0x0`; md5 `449cea5e7e2bcd214f0bb9a70a8e478e`):
 `neo-voice-pe-20260823-sat1-parity.factory.bin`, 1,936,560 B. Rebuild with
@@ -31,15 +41,20 @@ by preference.)
   the Sendspin heartbeat then misses its 15 s PONG deadline — that is what dropped Sat1 music every
   ~15 min. The PE gained Sendspin in `2e23b38`, so it has the same exposure.
 
-### Earlier, still unflashed (2026-08-02)
+### Earlier, committed 2026-08-02/03 — folded into the same 2026-08-23 flash above
+
+These predate the Aug-23 flash but were committed to the same branch before it and match what
+commit `27db7bd` ("port the current Sat1 firmware fixes") describes porting, so they went out with
+that flash too — this section used to say "still unflashed"; verify against the device rather than
+trusting either version of this doc.
 - **Barge-in reply pitch fix** — `process_received_audio_` now re-asserts `set_audio_stream_info(24kHz)`
   when restarting the speaker after a barge-in (else the follow-up reply plays 2× / high-pitched).
 - **Silent wake** — removed the wake chime (`play_sound(wake_word_triggered_sound)`); Neo wakes silent
   on all HW per Matt's preference.
 - **Sendspin / `speaker_source` migration** (Stage B) and a **session-scoped wake cutoff** so
   barge-in works again.
-- Already flashed 2026-08-02: server-driven `auto_stop_inactivity_ms` from the hello frame. Sat1-only
-  fixes (mic uplink 16k, red-LED no-HA check) do NOT apply to the PE.
+- Already flashed 2026-08-02 (predates even the above): server-driven `auto_stop_inactivity_ms` from
+  the hello frame. Sat1-only fixes (mic uplink 16k, red-LED no-HA check) do NOT apply to the PE.
 
 **Compiles clean** on esphome 2026.6.5 / ESP-IDF 5.5.4 — verify the version before every build
 (see the toolchain trap at the bottom of this file).

@@ -43,6 +43,10 @@ class VoiceAssistantWebSocket : public Component {
   void setup() override;
   void loop() override;
   void dump_config() override;
+  // INVARIANT: the uplink sender task must never outlive the component it sends for.
+  // App.safe_reboot() (and ESPHome shutdown) call this before the chip resets, so this is the one
+  // place the task is asked to exit and is joined.
+  void on_shutdown() override;
 
   void set_server_url(const std::string &url) { this->server_url_ = url; }
   void set_microphone(microphone::Microphone *mic) { this->microphone_ = mic; }
@@ -72,8 +76,16 @@ class VoiceAssistantWebSocket : public Component {
   // True while a turn is still "open with no reply audio yet" — i.e. we woke and started a
   // session but the bot hasn't produced any speaker audio. Gates button_cancel (a fast
   // cancel here means the wake was unwanted); once reply audio has played it's a real turn.
+  //
+  // INVARIANT: this asks "has this SESSION ever produced reply audio?", which is NOT the same
+  // question as the auto-stop inactivity reference. It used to read last_speaker_audio_time_ == 0,
+  // but interrupt() deliberately zeroes that timestamp (to drop the half-duplex guard and re-base
+  // the inactivity clock for the follow-up turn). So after ANY barge-in a genuine turn looked like
+  // "no reply audio yet", and a button press mislabelled it a false wake - poisoning the wake-word
+  // training flywheel with false negatives. reply_audio_seen_this_session_ is latched independently
+  // and cleared only at session start.
   bool turn_has_no_reply_audio() const {
-    return this->is_running() && this->last_speaker_audio_time_ == 0;
+    return this->is_running() && !this->reply_audio_seen_this_session_;
   }
   
   void set_state_callback(std::function<void(VoiceAssistantWebSocketState)> &&callback) {
@@ -95,7 +107,11 @@ class VoiceAssistantWebSocket : public Component {
  protected:
   void connect_websocket_();
   void disconnect_websocket_();
-  void send_text_frame_(const char *json);  // Send a JSON control text frame (shared by wake/flush/etc.)
+  // Send a JSON control text frame (shared by wake/flush/etc.).
+  // INVARIANT: a frame sent from the MAIN LOOP or the MIC TASK must pass a bounded ticks_to_wait.
+  // portMAX_DELAY on the main task parks every other ESPHome component (LEDs, mixer, watchdog)
+  // behind one TCP write; on the mic task it starves micro_wake_word's producer ring.
+  void send_text_frame_(const char *json, TickType_t ticks_to_wait = portMAX_DELAY);
   void enter_enrollment_();                 // pin mic open, disarm wake+stop models
   void exit_enrollment_();                  // restore normal wake/stop-model operation
   void send_audio_chunk_(const uint8_t *data, size_t len);
@@ -124,6 +140,43 @@ class VoiceAssistantWebSocket : public Component {
   Trigger<> stopped_trigger_{};
   Trigger<> enroll_start_trigger_{};
   Trigger<> enroll_stop_trigger_{};
+
+  // ---- Deferred YAML-automation dispatch ---------------------------------------------------
+  // INVARIANT: a Trigger<> (and state_callback_) is only ever fired from loop(), i.e. the MAIN
+  // task. ESP-IDF delivers websocket events on the client's own 8 KB task with the client lock
+  // held, and the YAML wired to these triggers calls main-loop-only APIs - mixer_speaker
+  // .apply_ducking (non-atomic gain writes racing the mixer task), the LED ring's perform() via
+  // control_leds, media_player.stop, micro_wake_word.stop/start. Firing them from the websocket
+  // event handler risked a stack overflow and held the client lock across arbitrary YAML - which
+  // is also the lock the microphone uplink needs. stopped_trigger_ was already dispatched this
+  // way; this generalises the same pattern to the other five and to state_callback_.
+  //
+  // Ordering is preserved: a FIFO, drained oldest-first, nothing coalesced. EV_STATE_CALLBACK
+  // carries the state observed WHEN THE EVENT HAPPENED, not the state at dispatch time.
+  enum class DeferredEvent : uint8_t {
+    EV_STATE_CALLBACK,
+    EV_CONNECTED,
+    EV_DISCONNECTED,
+    EV_ERROR,
+    EV_ENROLL_START,
+    EV_ENROLL_STOP,
+    EV_STOPPED,
+  };
+  struct DeferredEntry {
+    DeferredEvent event;
+    VoiceAssistantWebSocketState state;  // payload; only meaningful for EV_STATE_CALLBACK
+  };
+  static const size_t DEFERRED_QUEUE_LEN = 16;
+  DeferredEntry deferred_[DEFERRED_QUEUE_LEN]{};
+  size_t deferred_head_{0};   // next write slot
+  size_t deferred_tail_{0};   // next read slot
+  size_t deferred_count_{0};  // entries held
+  uint32_t deferred_overflow_{0};
+  SemaphoreHandle_t deferred_lock_{nullptr};
+  // Producers: websocket task and main task. Consumer: main task only.
+  void defer_event_(DeferredEvent event, VoiceAssistantWebSocketState state = VOICE_ASSISTANT_WEBSOCKET_IDLE);
+  void dispatch_deferred_();  // main task only; never holds deferred_lock_ across a trigger
+
   
   // Audio buffers
   std::vector<uint8_t> input_buffer_;
@@ -195,13 +248,71 @@ class VoiceAssistantWebSocket : public Component {
   uint8_t *preroll_{nullptr};
   size_t preroll_fill_{0};            // bytes held (saturates at PREROLL_CAPACITY)
   size_t preroll_head_{0};            // write cursor; once full this is also the OLDEST byte
+  // preroll_head_/preroll_fill_ are written by the MIC task (push/flush) and reset from the MAIN
+  // task (init) and the WEBSOCKET task (stop()). Unserialized, a reset landing between the head
+  // update and the fill update in preroll_push_ resurrects a stale fill over a rewound head, and a
+  // flush would then send bytes that were never contiguous - breaking the ring's one invariant.
+  // A DEDICATED mutex, NOT audio_ring_lock_: that lock is deliberately held across the whole
+  // speaker drain, and making the 16 kHz mic callback queue behind it would recreate the very
+  // mic-task stall the uplink sender task exists to remove.
+  // INVARIANT: this lock is never held across a network send. Flush snapshots under the lock,
+  // releases, and only then hands bytes to the uplink ring.
+  SemaphoreHandle_t preroll_lock_{nullptr};
   void preroll_init_();
   void preroll_push_(const uint8_t *data, size_t len);
   void preroll_flush_();
   void preroll_reset_();
 
+  // ---- Uplink ring + sender task -----------------------------------------------------------
+  // INVARIANT: the microphone callback NEVER blocks on the network. It runs on the shared,
+  // high-priority i2s mic task that also feeds micro_wake_word's ~120 ms producer ring; every
+  // millisecond spent inside esp_websocket_client_send_bin(..., portMAX_DELAY) is a millisecond
+  // mww is not being fed, and once that ring overflows mww RESETS it - the device goes deaf. That
+  // happened on every connect (preroll_flush_ pushed up to 48 KB in a loop) and on every session
+  // end (the client lock is held for up to 1 s inside close()); a WiFi stall made it unbounded.
+  //
+  // So the mic callback only memcpys into this PSRAM ring (never blocking, drop-OLDEST when full)
+  // and one dedicated low-priority task drains it with a BOUNDED send timeout.
+  //
+  // Capacity must comfortably exceed PREROLL_CAPACITY (48 KB), or a look-back flush could drop its
+  // own oldest bytes - which are exactly the wake word and the front of the command the look-back
+  // exists to rescue. 96 KB is ~2 s @ 24 kHz mono16 (the required minimum is ~500 ms).
+  static const size_t UPLINK_RING_CAPACITY = 96 * 1024;
+  static const size_t UPLINK_SEND_CHUNK = INPUT_BUFFER_SIZE;   // 100 ms per websocket frame
+  static const uint32_t UPLINK_SEND_TIMEOUT_MS = 200;          // bounded; never portMAX_DELAY
+  static const uint32_t UPLINK_DROP_LOG_INTERVAL_MS = 5000;    // rate-limit the drop report
+  uint8_t *uplink_ring_{nullptr};      // PSRAM
+  uint8_t *uplink_stage_{nullptr};     // internal-RAM copy-out, so the send holds no lock at all
+  size_t uplink_read_{0};
+  size_t uplink_fill_{0};
+  SemaphoreHandle_t uplink_lock_{nullptr};  // guards uplink_read_/uplink_fill_ only (tiny sections)
+  SemaphoreHandle_t uplink_wake_{nullptr};  // "data available" / "please exit" signal
+  TaskHandle_t uplink_task_{nullptr};
+  volatile bool uplink_task_exit_{false};
+  volatile bool uplink_task_running_{false};
+  volatile bool uplink_paused_{false};  // set while disconnect_websocket_() tears the client down
+  uint32_t uplink_dropped_bytes_{0};
+  uint32_t uplink_drop_events_{0};
+  uint32_t uplink_last_drop_log_{0};
+  void uplink_init_();                                    // main task, from setup(); creates once
+  void uplink_enqueue_(const uint8_t *data, size_t len);  // mic task; never blocks
+  void uplink_reset_();                                   // drop a dead session's queued audio
+  void uplink_shutdown_();                                // main task; asks the sender to exit
+  void uplink_run_();                                     // sender task body
+  static void uplink_task_fn_(void *param);
+
+  // Serializes the uplink sender's use of websocket_client_ against disconnect_websocket_()'s
+  // destroy of it. Taken with a BOUNDED timeout on both sides: the main loop must never sit behind
+  // a stalled TCP write. The WEBSOCKET task must never take this lock at all - it would deadlock
+  // against esp_websocket_client_close(), which joins that very task.
+  SemaphoreHandle_t ws_client_lock_{nullptr};
+
   // Auto-stop tracking
   uint32_t last_speaker_audio_time_{0};  // Last time we received audio from speaker
+  // "Did THIS session ever produce reply audio?" - latched true on the first speaker chunk and
+  // cleared only in start(). Deliberately NOT derived from last_speaker_audio_time_, which
+  // interrupt() zeroes on every barge-in (see turn_has_no_reply_audio()).
+  bool reply_audio_seen_this_session_{false};
   uint32_t running_since_{0};  // millis() the session went RUNNING; auto-stop reference when the bot
                                // hasn't spoken yet, so a bare wake with no reply still auto-closes.
   // Stop after N ms of speaker (bot) inactivity. Configurable via the
@@ -217,6 +328,12 @@ class VoiceAssistantWebSocket : public Component {
   bool pending_disconnect_{false};  // Flag to disconnect in loop() (cannot be called from websocket task)
   bool pending_reboot_{false};  // Flag to reboot in loop() (server {"type":"reboot"} frame; cannot reboot from websocket task)
   bool reconnect_pending_{false};
+  // Set alongside reconnect_pending_ when connect_websocket_() has to tear a stale client down
+  // before it can honour a FRESH WAKE. It has to be a separate flag because both websocket event
+  // handlers deliberately clear reconnect_pending_ on any drop/error ("no auto-reconnect on a
+  // network blip") - and the drop they clear it during is the very teardown the wake is queued
+  // behind. Cleared only by loop(), when it actually promotes the queued wake to a reconnect.
+  bool wake_reconnect_queued_{false};
   bool explicit_disconnect_{false};  // Flag to prevent reconnection after explicit disconnect
   uint32_t reconnect_attempts_{0};
   static const uint32_t MAX_RECONNECT_ATTEMPTS = 5;
