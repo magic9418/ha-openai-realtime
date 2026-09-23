@@ -107,7 +107,8 @@ class VoiceAssistantWebSocket : public Component {
 
  protected:
   void connect_websocket_();
-  void disconnect_websocket_();
+  bool disconnect_websocket_();
+  static void disconnect_task_fn_(void *param);
   // Send a JSON control text frame (shared by wake/flush/etc.).
   // INVARIANT: a frame sent from the MAIN LOOP or the MIC TASK must pass a bounded ticks_to_wait.
   // portMAX_DELAY on the main task parks every other ESPHome component (LEDs, mixer, watchdog)
@@ -313,6 +314,12 @@ class VoiceAssistantWebSocket : public Component {
   // a stalled TCP write. The WEBSOCKET task must never take this lock at all - it would deadlock
   // against esp_websocket_client_close(), which joins that very task.
   SemaphoreHandle_t ws_client_lock_{nullptr};
+  // IDF close/stop/destroy can block for the network timeout. Never perform
+  // that wait on ESPHome's loop task; a worker owns the detached handle while
+  // loop() continues servicing the watchdog and the rest of the device.
+  esp_websocket_client_handle_t disconnect_client_{nullptr};
+  std::atomic<bool> disconnect_task_active_{false};
+  std::atomic<bool> disconnect_task_done_{false};
 
   // Auto-stop tracking
   uint32_t last_speaker_audio_time_{0};  // Last time we received audio from speaker

@@ -59,7 +59,10 @@ void VoiceAssistantWebSocket::loop() {
   // Handle pending disconnect (must be done in main task, not websocket task)
   if (this->pending_disconnect_) {
     this->pending_disconnect_ = false;
-    this->disconnect_websocket_();
+    if (!this->disconnect_websocket_()) {
+      this->pending_disconnect_ = true;
+      return;
+    }
     // After disconnect, continue with stop() cleanup
     // Clear buffers
     this->input_buffer_.clear();
@@ -356,7 +359,12 @@ void VoiceAssistantWebSocket::connect_websocket_() {
   esp_websocket_client_config_t websocket_cfg = {};
   websocket_cfg.uri = this->server_url_.c_str();
   websocket_cfg.user_context = this;
-  websocket_cfg.buffer_size = 4096;
+  // A 4 KiB dynamic RX/TX buffer can no longer be allocated when Sendspin is
+  // playing and I2S owns its DMA pool. The client already fragments frames at
+  // buffer boundaries, and microphone chunks are handled as a single WebSocket
+  // message across those fragments, so 1 KiB preserves the protocol while
+  // allowing Neo to interrupt or stop active music under peak RAM pressure.
+  websocket_cfg.buffer_size = 1024;
   websocket_cfg.task_prio = 5;
   websocket_cfg.task_stack = 8192;
   websocket_cfg.transport = WEBSOCKET_TRANSPORT_OVER_TCP;  // Use TCP (not SSL) for ws://
@@ -394,9 +402,23 @@ void VoiceAssistantWebSocket::connect_websocket_() {
   }
 }
 
-void VoiceAssistantWebSocket::disconnect_websocket_() {
+bool VoiceAssistantWebSocket::disconnect_websocket_() {
+  if (this->disconnect_task_active_.load()) {
+    if (!this->disconnect_task_done_.load()) {
+      return false;
+    }
+
+    this->disconnect_client_ = nullptr;
+    this->disconnect_task_done_ = false;
+    this->disconnect_task_active_ = false;
+    this->uplink_paused_ = false;
+    this->uplink_reset_();
+    ESP_LOGD(TAG, "WebSocket teardown worker complete");
+    return true;
+  }
+
   if (this->websocket_client_ == nullptr) {
-    return;
+    return true;
   }
   ESP_LOGI(TAG, "Disconnecting WebSocket...");
 
@@ -422,33 +444,43 @@ void VoiceAssistantWebSocket::disconnect_websocket_() {
     }
   }
 
-  // Check if client is actually connected before trying graceful close
-  bool was_connected = esp_websocket_client_is_connected(client);
-
-  if (was_connected) {
-    // Try graceful close first (sends close frame)
-    // Use shorter timeout (1 second) to avoid blocking too long
-    esp_err_t close_err = esp_websocket_client_close(client, pdMS_TO_TICKS(1000));
-    if (close_err != ESP_OK) {
-      ESP_LOGW(TAG, "Graceful close failed (%s), forcing stop", esp_err_to_name(close_err));
-      // Fallback to immediate stop if graceful close fails
-      esp_websocket_client_stop(client);
-    }
-  } else {
-    // Client not connected, just stop and destroy immediately
-    ESP_LOGD(TAG, "Client not connected, stopping immediately");
-    esp_websocket_client_stop(client);
+  this->disconnect_client_ = client;
+  this->disconnect_task_done_ = false;
+  this->disconnect_task_active_ = true;
+  BaseType_t created = xTaskCreate(
+      &VoiceAssistantWebSocket::disconnect_task_fn_, "va_ws_cleanup", 4096, this, 4, nullptr);
+  if (created != pdPASS) {
+    ESP_LOGE(TAG, "Could not create WebSocket teardown worker; retrying next loop");
+    this->disconnect_task_active_ = false;
+    this->disconnect_client_ = nullptr;
+    this->websocket_client_ = client;
   }
-
-  // Always destroy the client to free resources
-  esp_websocket_client_destroy(client);
-
   if (locked) {
     xSemaphoreGive(this->ws_client_lock_);
   }
-  this->uplink_paused_ = false;
-  // The session is over: anything still queued belongs to it and must not leak into the next wake.
-  this->uplink_reset_();
+  return false;
+}
+
+void VoiceAssistantWebSocket::disconnect_task_fn_(void *param) {
+  auto *self = static_cast<VoiceAssistantWebSocket *>(param);
+  esp_websocket_client_handle_t client = self->disconnect_client_;
+
+  if (client != nullptr) {
+    if (esp_websocket_client_is_connected(client)) {
+      esp_err_t close_err = esp_websocket_client_close(client, pdMS_TO_TICKS(1000));
+      if (close_err != ESP_OK) {
+        ESP_LOGW(TAG, "Graceful close failed (%s), forcing stop", esp_err_to_name(close_err));
+        esp_websocket_client_stop(client);
+      }
+    } else {
+      ESP_LOGD(TAG, "Client not connected; stopping in teardown worker");
+      esp_websocket_client_stop(client);
+    }
+    esp_websocket_client_destroy(client);
+  }
+
+  self->disconnect_task_done_ = true;
+  vTaskDelete(nullptr);
 }
 
 void VoiceAssistantWebSocket::send_audio_chunk_(const uint8_t *data, size_t len) {

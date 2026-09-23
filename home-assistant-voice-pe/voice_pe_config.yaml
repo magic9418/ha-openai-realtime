@@ -29,6 +29,8 @@
 #    esphome upload voice_pe_config.yaml
 
 substitutions:
+  esp32_fw_version: neo-2026.09.23-office-pe-full.4
+  neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
   voice_assist_waiting_for_command_phase_id: '2'
@@ -66,6 +68,9 @@ esphome:
   friendly_name: Home Assistant OpenAI Realtime Voice
   name_add_mac_suffix: true
   min_version: 2025.11.0
+  project:
+    name: Neo.OfficeVoicePE
+    version: ${esp32_fw_version}
   on_boot:
     priority: 375
     then:
@@ -83,6 +88,8 @@ esphome:
       - lambda: |-
           id(init_in_progress) = false;
           id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  // idle baseline w/o HA
+          id(pe_intercom).set_temporary_dnd(false);
+          id(pe_intercom).set_persisted_allow_drop_in(true);
       - script.execute: control_leds
 
 esp32:
@@ -102,6 +109,13 @@ esp32:
       CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST: "y"
       CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY: "y"
       CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      # Intercom keeps one pinned-TLS control socket open. Allocate its TLS and
+      # WebSocket buffers only while they are actively carrying a frame so the
+      # I2S speaker can still obtain DMA-capable internal RAM when Neo replies.
+      CONFIG_MBEDTLS_DYNAMIC_BUFFER: "y"
+      CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN: "4096"
+      CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER: "y"
+      CONFIG_WS_DYNAMIC_BUFFER: "y"
       CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"
 
 wifi:
@@ -216,6 +230,24 @@ globals:
     initial_value: 'false'
 
 switch:
+  - platform: template
+    id: pe_intercom_allow_drop_in
+    name: Office PE Intercom Allow Drop-In
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: id(pe_intercom).set_persisted_allow_drop_in(true);
+    turn_off_action:
+      - lambda: id(pe_intercom).set_persisted_allow_drop_in(false);
+  - platform: template
+    id: pe_intercom_dnd
+    name: Office PE Intercom DND
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: id(pe_intercom).set_temporary_dnd(true);
+    turn_off_action:
+      - lambda: id(pe_intercom).set_temporary_dnd(false);
   # Master mute switch
   - platform: template
     id: master_mute_switch
@@ -284,7 +316,17 @@ binary_sensor:
               level: INFO
           - if:
               condition:
-                lambda: return !id(init_in_progress);
+                neo_intercom.is_active:
+                  id: pe_intercom
+              then:
+                - logger.log:
+                    format: "Button clicked - hanging up intercom"
+                    level: INFO
+                - neo_intercom.hangup:
+                    id: pe_intercom
+          - if:
+              condition:
+                lambda: return !id(init_in_progress) && !id(pe_intercom).has_call_ownership();
               then:
                 - logger.log:
                     format: "init_in_progress is false, checking voice assistant state"
@@ -425,6 +467,14 @@ binary_sensor:
     id: voice_assistant_connected
     lambda: |-
       return id(voice_assistant_ws).is_connected();
+  - platform: template
+    id: pe_intercom_speaker_available
+    internal: true
+    lambda: |-
+      return id(pe_intercom).is_intercom_output_available() &&
+             !id(voice_assistant_ws).is_running() &&
+             id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING &&
+             id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING;
 
 light:
   # Hardware LED ring
@@ -998,7 +1048,10 @@ speaker:
     dac_type: external
     channel: stereo  # Voice PE hardware expects stereo
     timeout: never
-    buffer_duration: 100ms   # 7/12 known-good. (Bumping this ate internal RAM that micro_wake_word needs for its tensor arena → wake word failed to start. The PSRAM ring buffer now absorbs reply bursts instead.)
+    # The local I2S component uses five 5 ms hardware DMA blocks (25 ms total),
+    # halving the hard-coded upstream internal-RAM cost. This 50 ms software
+    # ring lives in PSRAM and continues to absorb scheduler jitter.
+    buffer_duration: 50ms
     audio_dac: aic3204_dac
   
   # Virtual speaker to combine announcement and media streams together into one output
@@ -1166,7 +1219,11 @@ micro_wake_word:
   on_wake_word_detected:
     - if:
         condition:
-          switch.is_off: master_mute_switch
+          and:
+            - switch.is_off: master_mute_switch
+            - not:
+                neo_intercom.is_active:
+                  id: pe_intercom
         then:
           # Barge-in FIRST — before the chime. If Neo is mid-reply, "Neo" must cut it in ~a WS
           # round-trip, not ~1s later. A re-wake NEVER disconnects the session — interrupt() leaves
@@ -1208,7 +1265,13 @@ external_components:
   - source:
       type: local
       path: esphome/components
-    components: [voice_assistant_websocket]
+    components: [voice_assistant_websocket, i2s_audio]
+  # Shared Neo intercom transport plus its source-owned output reservation
+  # adapters. The PE profile replaces only Satellite1-specific hardware hooks.
+  - source:
+      type: local
+      path: ../../neo-audit-fixes/satellite1-release-r21/esphome/components
+    components: [neo_intercom, satellite1, tas2780, fusb302b]
   # Voice PE Hardware Components
   - source:
       type: git
@@ -1217,6 +1280,29 @@ external_components:
     components:
       - voice_kit
     refresh: 0s
+
+neo_intercom:
+  id: pe_intercom
+  enabled: !secret intercom_relay_enabled
+  startup_delay: 20s
+  allow_drop_in: !secret intercom_relay_allow_drop_in
+  device_id: ${neo_intercom_device_id}
+  hardware_profile: voice_pe
+  hardware_identity: voice-pe-xmos-v1
+  control_url: !secret intercom_control_url
+  media_url: !secret intercom_media_url
+  auth_token: !secret intercom_device_bearer
+  pinned_ca: !secret intercom_server_ca_pem
+  microphone: i2s_mics
+  speaker: announcement_resampling_speaker
+  speaker_available: pe_intercom_speaker_available
+  mute_sensor: hardware_mute_switch
+  i2s_sink: i2s_audio_speaker
+  announcement_resampler: announcement_resampling_speaker
+  media_resampler: voice_resampling_speaker
+  mixer: mixing_speaker
+  media_player: voice_media_player
+  chime_dma_profile_verified: true
 
 # Voice Assistant WebSocket Component
 voice_assistant_websocket:
@@ -1337,6 +1423,12 @@ voice_kit:
 # Text sensor for debugging
 text_sensor:
   - platform: template
+    id: pe_intercom_runtime_status
+    name: Office PE Intercom Runtime Status
+    entity_category: diagnostic
+    update_interval: 2s
+    lambda: return id(pe_intercom).runtime_status();
+  - platform: template
     name: "Voice Assistant Status"
     id: voice_assistant_status
     lambda: |-
@@ -1412,4 +1504,3 @@ time:
 
 debug:
   update_interval: 5s
-
