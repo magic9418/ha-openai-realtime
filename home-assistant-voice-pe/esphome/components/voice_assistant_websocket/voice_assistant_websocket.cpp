@@ -105,6 +105,23 @@ void VoiceAssistantWebSocket::loop() {
     ESP_LOGI(TAG, "Voice Assistant WebSocket stopped");
     return;  // Skip other loop operations after disconnect
   }
+
+  // The server emits `hello` only after its upstream Realtime session is ready.
+  // Release the queued microphone history here, on the main task, after the
+  // websocket receive callback has returned. Sending the opening burst from
+  // inside that callback can race the first inbound frame and drop the socket.
+  if (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING &&
+      !this->audio_transport_ready_.load()) {
+    if (this->server_ready_pending_.exchange(false)) {
+      this->audio_transport_ready_ = true;
+      ESP_LOGI(TAG, "Server ready; microphone uplink released");
+    } else if (this->running_since_ > 0 &&
+               (millis() - this->running_since_) > SERVER_READY_FALLBACK_MS) {
+      this->audio_transport_ready_ = true;
+      ESP_LOGW(TAG, "No server hello after %u ms; releasing microphone uplink for compatibility",
+               SERVER_READY_FALLBACK_MS);
+    }
+  }
   
   // Drain the assistant-audio backlog (PSRAM ring) into the speaker as it frees up.
   // INVARIANT: bytes only ever go into a RUNNING speaker. A barge-in stop() leaves the resampler
@@ -224,6 +241,8 @@ void VoiceAssistantWebSocket::start() {
   }
   
   ESP_LOGI(TAG, "Starting Voice Assistant WebSocket...");
+  this->audio_transport_ready_ = false;
+  this->server_ready_pending_ = false;
   this->state_ = VOICE_ASSISTANT_WEBSOCKET_STARTING;
 
   // Reset auto-stop tracking
@@ -283,6 +302,7 @@ void VoiceAssistantWebSocket::stop() {
   }
   
   ESP_LOGI(TAG, "Stopping Voice Assistant WebSocket...");
+  this->audio_transport_ready_ = false;
   this->state_ = VOICE_ASSISTANT_WEBSOCKET_STOPPING;
   
   // Don't stop microphone - micro_wake_word needs it to continue running
@@ -964,7 +984,9 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   // disarmed, and the server needs every rep frame to build the training WAV. Without the
   // `enrolling_` exception the enrollment recorder captured ~nothing (empty WAVs).
   const bool live = this->is_connected() &&
-                    (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING || this->enrolling_);
+                    ((this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING &&
+                      this->audio_transport_ready_.load()) ||
+                     this->enrolling_);
   // LOOK-BACK (front-of-command clip). When not live we no longer return early — we keep the most
   // recent PREROLL_MS in a ring so that a run-together "Neo play some alternative music" survives
   // micro_wake_word's detection latency. Those frames are already being delivered here (the callback
@@ -1208,6 +1230,7 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       
     case WEBSOCKET_EVENT_CONNECTED:
       ESP_LOGI(TAG, "WebSocket connected");
+      this->audio_transport_ready_ = false;
       this->state_ = VOICE_ASSISTANT_WEBSOCKET_RUNNING;
       this->running_since_ = millis();  // start the inactivity clock even if the bot never speaks
       this->reconnect_attempts_ = 0;
@@ -1329,6 +1352,8 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
                      AUDIO_RING_CAPACITY);
             this->report_audio_free_(true);
           }
+          // loop() opens the microphone path after this receive callback returns.
+          this->server_ready_pending_ = true;
         } else if (message.find("\"type\":\"enroll\"") != std::string::npos ||
                    message.find("\"type\": \"enroll\"") != std::string::npos) {
           // Enrollment mode enter/exit driven by the session-server EnrollmentConductor.
@@ -1347,6 +1372,7 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       break;
       
     case WEBSOCKET_EVENT_ERROR:
+      this->audio_transport_ready_ = false;
       if (event_data != nullptr) {
         // Log error information - note: error_handle may not be fully populated for all error types
         int sock_errno = event_data->error_handle.esp_transport_sock_errno;
@@ -1422,4 +1448,3 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
 
 }  // namespace voice_assistant_websocket
 }  // namespace esphome
-

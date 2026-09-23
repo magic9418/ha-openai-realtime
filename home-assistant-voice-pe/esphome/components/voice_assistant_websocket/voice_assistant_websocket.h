@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include <queue>
+#include <atomic>
 
 // Barge-in policy toggle (see on_microphone_data_):
 //   0 = DEFAULT half-duplex — mic muted while Neo speaks; barge-in is via the wake word ("Neo").
@@ -130,6 +131,12 @@ class VoiceAssistantWebSocket : public Component {
   void *websocket_client_{nullptr};
 #endif
   VoiceAssistantWebSocketState state_{VOICE_ASSISTANT_WEBSOCKET_IDLE};
+  // CONNECTED means the WebSocket is open, not that the server's upstream
+  // Realtime session is ready. Keep microphone backlog gated until `hello`
+  // has returned and the websocket receive callback has unwound.
+  std::atomic<bool> audio_transport_ready_{false};
+  std::atomic<bool> server_ready_pending_{false};
+  static const uint32_t SERVER_READY_FALLBACK_MS = 5000;
   
   std::function<void(VoiceAssistantWebSocketState)> state_callback_;
   
@@ -438,4 +445,3 @@ template<typename... Ts> class VoiceAssistantWebSocketTurnHasNoReplyAudioConditi
 
 }  // namespace voice_assistant_websocket
 }  // namespace esphome
-
