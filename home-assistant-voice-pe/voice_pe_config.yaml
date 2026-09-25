@@ -82,6 +82,16 @@ esphome:
       # api.on_client_connected, so whenever the device wasn't adopted in HA the wake word was dead
       # (no "Neo"). Start it here once voice_kit is up (~a few seconds after boot). The api handler
       # below still (idempotently) starts it too, so an HA connection is a bonus, not a requirement.
+      #
+      # micro_wake_word only auto-enables the FIRST model in `models:` on a device's very first
+      # boot (esphome/components/micro_wake_word/__init__.py: `default_enabled = i == 0`); every
+      # other model — riker_wake_word here — boots DISABLED and stays that way until something
+      # calls micro_wake_word.enable_model, at which point the enabled state is persisted to flash
+      # (streaming_model.cpp WakeWordModel::enable() saves to its own ESPPreferenceObject) and
+      # survives future reboots on its own. Call it here, every boot, before starting detection —
+      # cheap once already enabled/persisted, and it's what actually turns Riker on at all. Without
+      # this, Riker compiles, ships, and silently never detects.
+      - micro_wake_word.enable_model: riker_wake_word
       - delay: 4s
       - micro_wake_word.start:
           id: mww
@@ -156,7 +166,10 @@ api:
   on_client_connected:
     - lambda: id(init_in_progress) = false;
     - script.execute: control_leds
-    # Start micro_wake_word when API connects (ensures it's ready)
+    # Start micro_wake_word when API connects (ensures it's ready). Also re-assert riker_wake_word's
+    # enable — belt-and-suspenders alongside the on_boot call above, same reasoning (default_enabled
+    # only applies to the first model in the list).
+    - micro_wake_word.enable_model: riker_wake_word
     - micro_wake_word.start:
         id: mww
   on_client_disconnected:
@@ -1216,22 +1229,28 @@ micro_wake_word:
       # lowering the cutoff — that re-enters the yo-yo this whole comment exists to end.
       probability_cutoff: 0.96
     # Riker — second wake word, dual-wake pilot (riker_migration_plan.md Phase 1).
-    # Trained 2026-09-24 on ~synthetic piper positives (10k Riker + 16 adversarial words,
-    # 500 samples each incl. striker/biker/hiker/Mike/Rick/etc — see
-    # ~/neo-wakeword/out/riker_calibration.json for the full window x cutoff sweep).
-    # sliding_window_size 3 (below, riker.json) was picked from DATA, not copied from Neo's
-    # 8: Riker's confidence peak turned out narrower than Neo's, so a WIDER window (5 or 8)
-    # measurably hurt recall here (0.97 recall @ window 3 vs ~0.42 @ window 8 at comparable
-    # cutoffs) even though the raw peak-width measurement (FWHM ~6 frames) suggested
-    # otherwise — the empirical sweep overrides the heuristic. Do not "fix" this back to 8
-    # without re-running the sweep.
-    # cutoff 0.90 idle / 0.72 session-scoped barge-in (int 229 / 183 below) chosen from the
-    # sweep at window 3: 0.90 -> recall 0.90, ambient_faph 0.067, 'rick' FA 0.20 (idle should
-    # stay quiet); 0.72 -> recall 0.95, ambient_faph 0.266 (same ballpark as Neo's own
-    # baseline 0.333 at ITS strict operating point), 'rick' FA 0.42 -- rick is the genuinely
-    # hard confusable (not striker, which stays <=0.04 across this whole range) because it's
-    # phonetically the first syllable of Riker; acceptable for a session-scoped loose tier,
-    # revisit if real barge-in false-wakes on "Rick" show up during the trial.
+    # v1 trained 2026-09-24 (10k Riker positives, 16 adversarial words x 500 samples each incl.
+    # striker/biker/hiker/Mike/Rick/etc, 10k training steps -- same step count as Neo's own
+    # recipe) scored recall 0.90 @ window 3/cutoff 0.90 with 'rick' FA 0.20-0.42 -- worse than
+    # Neo's own 0.989 baseline recall. **v2 (shipped here, trained 2026-09-25)** raised
+    # training_steps to 30k (3x) and oversampled/penalized specifically 'rick' and 'mike'
+    # (sampling_weight 12.0/penalty_weight 4.0 vs 4.0/2.0 for the other 14 adversarial words --
+    # see HEAVY_ADVERSARIAL_WORDS in ~/neo-wakeword/make_training_config_word.py) since those two,
+    # not 'striker', were what the v1 held-out eval actually flagged as the confusables. Full
+    # sweep: ~/neo-wakeword/out/riker_calibration_v2.json (v1's kept alongside as
+    # riker_calibration_v1.json / previous_riker_v1.tflite for the comparison).
+    # sliding_window_size 3 (below, riker.json) stays picked from DATA, not copied from Neo's 8:
+    # Riker's confidence peak is narrower than Neo's, so a WIDER window (5 or 8) measurably hurts
+    # recall here even though the raw peak-width/FWHM measurement suggested otherwise -- the
+    # empirical sweep overrides the heuristic. Do not "fix" this back to 8 without re-running it.
+    # cutoff 0.90 idle / 0.80 session-scoped barge-in (int 229 / 204 below), v2 @ window 3:
+    #   0.90 -> recall 0.947, ambient_faph 0.067, rick FA 0.00, striker FA 0.04 (idle stays quiet)
+    #   0.80 -> recall 0.962, ambient_faph 0.200, rick FA 0.02, striker FA 0.06
+    # (v1 at the same points was recall 0.90/0.95 with rick FA 0.20/0.42 -- v2 wins on both
+    # recall AND the rick confusable at matched ambient_faph). This PE build has only these 2
+    # cutoff tiers (idle/session) for either model -- the 3-tier idle/session/music-playing scheme
+    # some notes reference is Sat1-only (`update_wake_sensitivity`, a different repo/config,
+    # Phase 3 scope) and doesn't exist in this file for Neo either; nothing to map here.
     - model: wake_words/riker.json
       id: riker_wake_word
       probability_cutoff: 0.9
@@ -1369,7 +1388,7 @@ voice_assistant_websocket:
     # micro_wake_word exposes no YAML action for this, but WakeWordModel::set_probability_cutoff
     # is public and the cutoff is quantised as int(probability * 255): 0.90 -> 229, 0.96 -> 244.
     - lambda: id(primary_wake_word).set_probability_cutoff(229);   # 0.90 — barge-in over playback
-    - lambda: id(riker_wake_word).set_probability_cutoff(183);     # 0.72 — riker's session-scoped tier (see calibrate_riker.py notes above)
+    - lambda: id(riker_wake_word).set_probability_cutoff(204);     # 0.80 — riker's session-scoped tier, re-derived from the v2 (rick/mike-weighted, 30k-step) model's own sweep (see calibrate_riker.py notes above)
   on_disconnected:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # turn ended → idle (ring off), NOT not_ready (red). Red is reserved for WiFi-down.
     - script.execute: control_leds
