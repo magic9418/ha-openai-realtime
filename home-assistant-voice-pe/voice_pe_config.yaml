@@ -29,7 +29,7 @@
 #    esphome upload voice_pe_config.yaml
 
 substitutions:
-  esp32_fw_version: neo-2026.09.23-office-pe-full.4
+  esp32_fw_version: neo-2026.09.24-riker-dualwake.1
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -1176,8 +1176,13 @@ micro_wake_word:
   stop_after_detection: false
   models:
     # Primary wake word — driven by the ${wake_word_model} substitution above
-    # (now the custom "Neo" model). Only this one is active so the assistant
-    # wakes to "Neo" and nothing else, matching the Neo persona.
+    # (now the custom "Neo" model). Neo/Riker dual-wake pilot (riker_migration_plan.md
+    # Phase 1 step 5): BOTH models are active during the trial so either name wakes the
+    # device. on_wake_word_detected below is a single component-level trigger that fires
+    # for whichever model matched — it doesn't branch on which one, so no change was
+    # needed there for "either word wakes." Only the per-model cutoff tiers need a second
+    # copy (see riker_wake_word below + the 4 set_probability_cutoff lambdas near
+    # voice_assistant_websocket's on_connected/on_disconnected/on_stopped/on_error).
     - model: ${wake_word_model}
       id: primary_wake_word
       # Override the model's default 0.98 cutoff. 0.98 is great when idle but too strict to catch
@@ -1210,6 +1215,26 @@ micro_wake_word:
       # known-good floor to fall back to if 8 is still deaf. Do NOT answer a deaf window by
       # lowering the cutoff — that re-enters the yo-yo this whole comment exists to end.
       probability_cutoff: 0.96
+    # Riker — second wake word, dual-wake pilot (riker_migration_plan.md Phase 1).
+    # Trained 2026-09-24 on ~synthetic piper positives (10k Riker + 16 adversarial words,
+    # 500 samples each incl. striker/biker/hiker/Mike/Rick/etc — see
+    # ~/neo-wakeword/out/riker_calibration.json for the full window x cutoff sweep).
+    # sliding_window_size 3 (below, riker.json) was picked from DATA, not copied from Neo's
+    # 8: Riker's confidence peak turned out narrower than Neo's, so a WIDER window (5 or 8)
+    # measurably hurt recall here (0.97 recall @ window 3 vs ~0.42 @ window 8 at comparable
+    # cutoffs) even though the raw peak-width measurement (FWHM ~6 frames) suggested
+    # otherwise — the empirical sweep overrides the heuristic. Do not "fix" this back to 8
+    # without re-running the sweep.
+    # cutoff 0.90 idle / 0.72 session-scoped barge-in (int 229 / 183 below) chosen from the
+    # sweep at window 3: 0.90 -> recall 0.90, ambient_faph 0.067, 'rick' FA 0.20 (idle should
+    # stay quiet); 0.72 -> recall 0.95, ambient_faph 0.266 (same ballpark as Neo's own
+    # baseline 0.333 at ITS strict operating point), 'rick' FA 0.42 -- rick is the genuinely
+    # hard confusable (not striker, which stays <=0.04 across this whole range) because it's
+    # phonetically the first syllable of Riker; acceptable for a session-scoped loose tier,
+    # revisit if real barge-in false-wakes on "Rick" show up during the trial.
+    - model: wake_words/riker.json
+      id: riker_wake_word
+      probability_cutoff: 0.9
     # Extra triggers disabled for the Neo build — uncomment to also wake on these:
     # - model: hey_jarvis
     #   id: hey_jarvis
@@ -1344,6 +1369,7 @@ voice_assistant_websocket:
     # micro_wake_word exposes no YAML action for this, but WakeWordModel::set_probability_cutoff
     # is public and the cutoff is quantised as int(probability * 255): 0.90 -> 229, 0.96 -> 244.
     - lambda: id(primary_wake_word).set_probability_cutoff(229);   # 0.90 — barge-in over playback
+    - lambda: id(riker_wake_word).set_probability_cutoff(183);     # 0.72 — riker's session-scoped tier (see calibrate_riker.py notes above)
   on_disconnected:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # turn ended → idle (ring off), NOT not_ready (red). Red is reserved for WiFi-down.
     - script.execute: control_leds
@@ -1356,6 +1382,7 @@ voice_assistant_websocket:
         decibel_reduction: 0
         duration: 1.0s
     - lambda: id(primary_wake_word).set_probability_cutoff(244);   # back to strict 0.96 when idle
+    - lambda: id(riker_wake_word).set_probability_cutoff(229);     # back to strict riker 0.90 when idle
   on_stopped:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # turn ended → idle (ring off), NOT not_ready (red). Red is reserved for WiFi-down.
     - script.execute: control_leds
@@ -1365,6 +1392,7 @@ voice_assistant_websocket:
         decibel_reduction: 0
         duration: 1.0s
     - lambda: id(primary_wake_word).set_probability_cutoff(244);   # back to strict 0.96 when idle
+    - lambda: id(riker_wake_word).set_probability_cutoff(229);     # back to strict riker 0.90 when idle
   on_error:
     - if:
         condition:
@@ -1380,6 +1408,7 @@ voice_assistant_websocket:
     # Deliberately OUTSIDE the init guard above: a stranded loose cutoff means the device
     # false-wakes on ambience forever, so restore it on every error path without exception.
     - lambda: id(primary_wake_word).set_probability_cutoff(244);   # back to strict 0.96
+    - lambda: id(riker_wake_word).set_probability_cutoff(229);     # back to strict riker 0.90
   # Wake-word enrollment mode (docs/wakeword_flywheel_plan.md Phase 3). The C++ owns the
   # mic-pin + 15-min safety cap + WS-drop restore; the YAML just disarms/re-arms the wake
   # model so guided reps ("Neo, Neo, Neo...") don't self-trigger while streaming.
