@@ -29,7 +29,7 @@
 #    esphome upload voice_pe_config.yaml
 
 substitutions:
-  esp32_fw_version: neo-2026.09.25-riker-dualwake.2
+  esp32_fw_version: neo-2026.09.27-enroll-mic-fix.1
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -1431,20 +1431,44 @@ voice_assistant_websocket:
   # Wake-word enrollment mode (docs/wakeword_flywheel_plan.md Phase 3). The C++ owns the
   # mic-pin + 15-min safety cap + WS-drop restore; the YAML just disarms/re-arms the wake
   # model so guided reps ("Neo, Neo, Neo...") don't self-trigger while streaming.
+  #
+  # 2026-09-27 FIX (empty-enrollment-WAV / orphan-coach bug): this used to call
+  # `micro_wake_word.stop()` here. micro_wake_word owns its mic access through its OWN
+  # `microphone::MicrophoneSource`, whose `stop()` calls straight through to the shared
+  # `Microphone::stop()` (esphome/components/microphone/microphone_source.cpp) with NO
+  # reference counting against other consumers. voice_assistant_websocket holds a raw
+  # `microphone::Microphone *` to that SAME `i2s_mics` component (not its own MicrophoneSource),
+  # so stopping mww during enrollment could stop the physical mic out from under the enrollment
+  # recorder too -- `enter_enrollment_()`'s own `microphone_->start()` guard runs too early (in the
+  # websocket task, before this deferred trigger even fires) to protect against it. Confirmed via a
+  # live diagnostic (session-server enroll.py instrumented 2026-09-26/27): zero mic frames reached
+  # the recorder after enroll start, and the device then dropped its WS entirely -- a hard reboot
+  # from an I2S fault sharing the bus with active speaker (coach TTS) output is the leading theory,
+  # though the mic-starvation on its own already explains the empty WAV regardless.
+  #
+  # Fix: never stop mww here at all -- raise both models' cutoffs to (quantized) 1.0, i.e.
+  # unreachable, the same session-scoped-cutoff mechanism already used for barge-in sensitivity
+  # elsewhere in this file (WakeWordModel::set_probability_cutoff). mww keeps running (and keeps
+  # its OWN mic source open) throughout enrollment; a rep audibly matching "Neo"/"Riker" simply
+  # can never cross an impossible bar, so it can't self-trigger, and the shared mic is never
+  # touched. Restore to the normal IDLE cutoffs on stop (244/0.96 Neo, 229/0.90 Riker -- the same
+  # values the on_error/on_disconnected/on_stopped paths restore to).
   on_enroll_start:
     - lambda: id(wake_enrolling) = true;
     - logger.log:
-        format: "Enrollment start - stopping micro_wake_word so reps don't self-trigger"
+        format: "Enrollment start - raising wake cutoffs to unreachable (mic stays owned by voice_assistant_websocket, not stopped)"
         level: INFO
-    - micro_wake_word.stop:
-        id: mww
+    - lambda: |-
+        id(primary_wake_word).set_probability_cutoff(255);
+        id(riker_wake_word).set_probability_cutoff(255);
   on_enroll_stop:
     - lambda: id(wake_enrolling) = false;
     - logger.log:
-        format: "Enrollment stop - re-arming micro_wake_word"
+        format: "Enrollment stop - restoring idle wake cutoffs"
         level: INFO
-    - micro_wake_word.start:
-        id: mww
+    - lambda: |-
+        id(primary_wake_word).set_probability_cutoff(244);   // back to strict 0.96
+        id(riker_wake_word).set_probability_cutoff(229);     // back to strict riker 0.90
 
 # Voice Kit Component - Voice PE Hardware (XMOS Firmware)
 # The XMOS XU316 chip has built-in audio processing support:
