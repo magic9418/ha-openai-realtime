@@ -131,6 +131,19 @@ esp32:
       CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
       CONFIG_SPIRAM_RODATA: "y"
       CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      # fix/pe-heap: IDF's generic malloc()/heap_caps_malloc
+      # (MALLOC_CAP_DEFAULT|MALLOC_CAP_8BIT) prefers INTERNAL RAM for any request under this
+      # threshold, PSRAM or not (Kconfig default 16384 = 16 KB) — so every small allocation the
+      # rest of the stack makes with plain malloc() (esp_websocket_client's rx/tx buffers,
+      # mbedTLS session/cert structures, the HTTP client, JSON parsing, etc.) lands in internal
+      # DRAM regardless of the 8 MB of idle PSRAM. None of those buffers are DMA targets (DMA
+      # buffers request MALLOC_CAP_DMA explicitly and are unaffected by this setting), so lowering
+      # the threshold is safe and is the single highest-leverage lever here: it's a system-wide
+      # redirect, not a one-component fix, and it applies to the intercom's persistent TLS control
+      # socket too even though that component isn't touched by this branch. 512 B keeps genuinely
+      # tiny/hot allocations (semaphores, small structs) internal and pushes everything else - in
+      # particular every KB-plus WS/TLS/HTTP buffer - out to PSRAM.
+      CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL: "512"
       CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST: "y"
       CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY: "y"
       CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"

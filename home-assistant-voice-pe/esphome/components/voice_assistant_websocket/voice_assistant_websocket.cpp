@@ -40,6 +40,18 @@ void VoiceAssistantWebSocket::setup() {
   }
 }
 
+void VoiceAssistantWebSocket::log_heap_stats_(const char *when) {
+#ifdef USE_ESP_IDF
+  uint32_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  uint32_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  uint32_t min_ever = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+  uint32_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  ESP_LOGI(TAG, "Heap[%s]: internal free=%u largest_block=%u min_ever=%u psram_free=%u",
+           when, (unsigned) free_internal, (unsigned) largest_block, (unsigned) min_ever,
+           (unsigned) free_psram);
+#endif
+}
+
 void VoiceAssistantWebSocket::loop() {
   // Fire any YAML automation queued by the websocket task. MUST be first, and MUST be on this
   // (main) task: the triggers run mixer_speaker.apply_ducking, the LED ring's perform() and
@@ -221,9 +233,17 @@ void VoiceAssistantWebSocket::loop() {
 
   // Audio input is handled via callback (on_microphone_data_)
   // No need to poll here
-  
+
   // Audio output is handled directly in process_received_audio_()
   // No queue processing needed here
+
+  // fix/pe-heap: periodic idle trend line, independent of session start/stop, so a log pull
+  // spanning no sessions at all still shows whether internal heap is drifting.
+  uint32_t now = millis();
+  if (now - this->last_idle_heap_log_ >= IDLE_HEAP_LOG_INTERVAL_MS) {
+    this->last_idle_heap_log_ = now;
+    this->log_heap_stats_("idle");
+  }
 }
 
 void VoiceAssistantWebSocket::dump_config() {
@@ -447,9 +467,34 @@ bool VoiceAssistantWebSocket::disconnect_websocket_() {
   this->disconnect_client_ = client;
   this->disconnect_task_done_ = false;
   this->disconnect_task_active_ = true;
-  BaseType_t created = xTaskCreate(
-      &VoiceAssistantWebSocket::disconnect_task_fn_, "va_ws_cleanup", 4096, this, 4, nullptr);
-  if (created != pdPASS) {
+  // fix/pe-heap: one PSRAM-backed stack, allocated once and reused for every teardown (only one
+  // can ever be in flight - guarded above by disconnect_task_active_/disconnect_task_done_).
+  // Was a fresh xTaskCreate(..., 4096, ...) INTERNAL stack per disconnect; that per-connect-cycle
+  // 4 KB internal request is the leading suspect for the observed
+  // "Could not create WebSocket teardown worker; retrying next loop" failures under load, since
+  // task-stack allocation needs one contiguous internal block and internal DRAM is what's tight.
+  TaskHandle_t disconnect_task_handle = nullptr;
+#ifdef USE_ESP_IDF
+  if (this->disconnect_task_stack_ == nullptr) {
+    this->disconnect_task_stack_ = static_cast<StackType_t *>(
+        heap_caps_malloc(DISCONNECT_TASK_STACK_BYTES, MALLOC_CAP_SPIRAM));
+  }
+#endif
+  bool created = false;
+  if (this->disconnect_task_stack_ != nullptr) {
+    disconnect_task_handle = xTaskCreateStaticPinnedToCore(
+        &VoiceAssistantWebSocket::disconnect_task_fn_, "va_ws_cleanup", DISCONNECT_TASK_STACK_BYTES,
+        this, 4, this->disconnect_task_stack_, &this->disconnect_task_tcb_, tskNO_AFFINITY);
+    created = disconnect_task_handle != nullptr;
+  }
+  if (!created) {
+    // PSRAM exhausted or alloc failed at boot - fall back to the old dynamic/internal path so a
+    // teardown is still attempted rather than silently dropped.
+    ESP_LOGW(TAG, "No PSRAM stack for teardown worker; falling back to internal xTaskCreate");
+    created = xTaskCreate(&VoiceAssistantWebSocket::disconnect_task_fn_, "va_ws_cleanup", 4096, this,
+                           4, nullptr) == pdPASS;
+  }
+  if (!created) {
     ESP_LOGE(TAG, "Could not create WebSocket teardown worker; retrying next loop");
     this->disconnect_task_active_ = false;
     this->disconnect_client_ = nullptr;
@@ -778,10 +823,33 @@ void VoiceAssistantWebSocket::uplink_init_() {
     // own receive/dispatch task; both sit far below the i2s mic task (17), whose latency is the
     // entire point of this change, and well above the ESPHome main loop (1) so audio keeps moving
     // while loop() works.
-    if (xTaskCreate(&VoiceAssistantWebSocket::uplink_task_fn_, "va_ws_uplink", 4096, this, 5,
-                    &this->uplink_task_) != pdPASS) {
-      this->uplink_task_ = nullptr;
-      ESP_LOGE(TAG, "Failed to create uplink sender task - falling back to blocking sends");
+    //
+    // fix/pe-heap: this task runs for the device's entire lifetime, so its stack was a permanent
+    // 4 KB internal-DRAM cost under plain xTaskCreate (task stacks always come from
+    // MALLOC_CAP_INTERNAL there, regardless of PSRAM). CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
+    // is already "y" in this board's sdkconfig, so give the stack PSRAM via
+    // xTaskCreateStaticPinnedToCore and keep only the small TCB (a plain member, not a heap
+    // allocation) internal.
+#ifdef USE_ESP_IDF
+    if (this->uplink_task_stack_ == nullptr) {
+      this->uplink_task_stack_ =
+          static_cast<StackType_t *>(heap_caps_malloc(UPLINK_TASK_STACK_BYTES, MALLOC_CAP_SPIRAM));
+    }
+#endif
+    if (this->uplink_task_stack_ != nullptr) {
+      this->uplink_task_ = xTaskCreateStaticPinnedToCore(
+          &VoiceAssistantWebSocket::uplink_task_fn_, "va_ws_uplink", UPLINK_TASK_STACK_BYTES, this, 5,
+          this->uplink_task_stack_, &this->uplink_task_tcb_, tskNO_AFFINITY);
+    }
+    if (this->uplink_task_ == nullptr) {
+      // PSRAM exhausted or alloc failed - fall back to the old dynamic/internal path so uplink
+      // still works (degraded: back to the internal-RAM cost this change is meant to remove).
+      ESP_LOGW(TAG, "No PSRAM stack for uplink sender; falling back to internal xTaskCreate");
+      if (xTaskCreate(&VoiceAssistantWebSocket::uplink_task_fn_, "va_ws_uplink", 4096, this, 5,
+                      &this->uplink_task_) != pdPASS) {
+        this->uplink_task_ = nullptr;
+        ESP_LOGE(TAG, "Failed to create uplink sender task - falling back to blocking sends");
+      }
     }
   }
 }
@@ -1262,6 +1330,7 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       
     case WEBSOCKET_EVENT_CONNECTED:
       ESP_LOGI(TAG, "WebSocket connected");
+      this->log_heap_stats_("ws_connected");
       this->audio_transport_ready_ = false;
       this->state_ = VOICE_ASSISTANT_WEBSOCKET_RUNNING;
       this->running_since_ = millis();  // start the inactivity clock even if the bot never speaks
@@ -1287,6 +1356,7 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       
     case WEBSOCKET_EVENT_DISCONNECTED:
       ESP_LOGW(TAG, "WebSocket disconnected");
+      this->log_heap_stats_("ws_disconnected");
       this->state_ = VOICE_ASSISTANT_WEBSOCKET_DISCONNECTED;
 
       // Never leave the box stuck in enrollment if the session drops mid-coach.

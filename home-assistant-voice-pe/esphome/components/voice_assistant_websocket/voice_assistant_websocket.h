@@ -119,6 +119,16 @@ class VoiceAssistantWebSocket : public Component {
   void send_audio_chunk_(const uint8_t *data, size_t len);
   void process_received_audio_(const uint8_t *data, size_t len);
   void on_microphone_data_(const std::vector<uint8_t> &data);
+  // fix/pe-heap observability: logs internal-DRAM free,
+  // largest free block (fragmentation), min-ever-free, and PSRAM free, all via heap_caps_*
+  // directly - not the `debug:` component's sensors, which publish through the `sensor:`
+  // logger tag this device silences to WARN (see voice_pe_config.yaml logger.logs). Tagged
+  // under "voice_assistant_websocket" (kept at DEBUG), so it survives a plain `esphome logs`
+  // pull with no HA/Console involved. Called at session connect, session disconnect, and
+  // (throttled) once per idle interval from loop().
+  void log_heap_stats_(const char *when);
+  uint32_t last_idle_heap_log_{0};
+  static const uint32_t IDLE_HEAP_LOG_INTERVAL_MS = 60000;
   static void websocket_event_handler_(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
   void handle_websocket_event_(esp_websocket_event_id_t event_id, esp_websocket_event_data_t *event_data);
   
@@ -296,6 +306,15 @@ class VoiceAssistantWebSocket : public Component {
   SemaphoreHandle_t uplink_lock_{nullptr};  // guards uplink_read_/uplink_fill_ only (tiny sections)
   SemaphoreHandle_t uplink_wake_{nullptr};  // "data available" / "please exit" signal
   TaskHandle_t uplink_task_{nullptr};
+  // fix/pe-heap: uplink_task_ lives for the whole device lifetime, so its ~4 KB FreeRTOS stack
+  // was a permanent internal-DRAM cost (xTaskCreate() always backs the stack with
+  // MALLOC_CAP_INTERNAL, PSRAM or not). CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY is already "y"
+  // in the IDF sdkconfig this board builds with, so xTaskCreateStaticPinnedToCore can take a
+  // PSRAM-backed stack instead - only the small TCB itself (StaticTask_t, ~100 B, no allocator
+  // involved, it's a plain member) stays internal. See uplink_init_().
+  StaticTask_t uplink_task_tcb_{};
+  StackType_t *uplink_task_stack_{nullptr};  // heap_caps_malloc'd from MALLOC_CAP_SPIRAM
+  static const uint32_t UPLINK_TASK_STACK_BYTES = 4096;
   volatile bool uplink_task_exit_{false};
   volatile bool uplink_task_running_{false};
   volatile bool uplink_paused_{false};  // set while disconnect_websocket_() tears the client down
@@ -320,6 +339,16 @@ class VoiceAssistantWebSocket : public Component {
   esp_websocket_client_handle_t disconnect_client_{nullptr};
   std::atomic<bool> disconnect_task_active_{false};
   std::atomic<bool> disconnect_task_done_{false};
+  // fix/pe-heap: this teardown worker used to be a plain xTaskCreate(..., 4096, ...) - a fresh
+  // 4 KB INTERNAL stack allocated on every WebSocket disconnect and freed (lazily, by the idle
+  // task) on every exit. disconnect_task_active_ already guarantees only one is ever in flight,
+  // so one PSRAM-backed static stack, allocated once and reused, removes that per-disconnect
+  // internal-heap churn entirely - this is the allocation implicated in the observed
+  // "Could not create WebSocket teardown worker; retrying next loop" failures under load
+  // (internal heap too fragmented to satisfy a fresh 4 KB stack request).
+  StaticTask_t disconnect_task_tcb_{};
+  StackType_t *disconnect_task_stack_{nullptr};  // heap_caps_malloc'd from MALLOC_CAP_SPIRAM, once
+  static const uint32_t DISCONNECT_TASK_STACK_BYTES = 4096;
 
   // Auto-stop tracking
   uint32_t last_speaker_audio_time_{0};  // Last time we received audio from speaker
