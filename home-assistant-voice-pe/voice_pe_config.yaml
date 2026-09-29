@@ -29,7 +29,7 @@
 #    esphome upload voice_pe_config.yaml
 
 substitutions:
-  esp32_fw_version: neo-2026.09.27-enroll-mic-fix.1
+  esp32_fw_version: neo-2026.09.29-penny-only.1
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -55,13 +55,34 @@ substitutions:
   #   - a microWakeWord v2 shorthand name (okay_nabu, hey_jarvis, hey_mycroft, hey_rhasspy)
   #     = github://esphome/micro-wake-word-models/models/v2/<name>.json
   #   - a local path to a custom manifest (relative to this yaml), or a github:// URL.
-  # Custom "Neo" model (trained 2026-07-10, int8 streaming). To fall back to a stock
-  # trigger, set this to `okay_nabu`. github URL alt:
-  #   github://magic9418/ha-openai-realtime/home-assistant-voice-pe/wake_words/neo.json@local-fixes
-  # Custom "Neo" v2 model. Requires the ESPHome 2026.6.5 toolchain (pinned in pyproject.toml) —
-  # on 2025.11.4 the v2 tensor arena fails to allocate. To fall back to a stock trigger, set
-  # `okay_nabu`. github URL alt: github://magic9418/ha-openai-realtime/.../wake_words/neo.json@local-fixes
-  wake_word_model: wake_words/neo.json
+  # Custom "Penny" model (2026-09-29: Neo AND Riker dropped entirely, single-wake-word build).
+  # Requires the ESPHome 2026.6.5 toolchain (pinned in pyproject.toml) — on 2025.11.4 the v2
+  # tensor arena fails to allocate ("Failed to allocate tensors"). To fall back to a stock
+  # trigger, set `okay_nabu`.
+  #
+  # ⚠️ PROVISIONAL: wake_words/penny.{tflite,json} is the v2 PLACEHOLDER model (synthetic-trained,
+  # NOT real-voice validated — see the "status" field the training harness writes to
+  # ~/neo-wakeword/out/penny.json). A better v4 model is being trained in parallel and will ship
+  # as out/penny_v4.{tflite,json} with its own recommended cutoff/window. TO SWAP IT IN: overwrite
+  # wake_words/penny.tflite + wake_words/penny.json with the v4 files (zero YAML change beyond
+  # this comment), OR point this substitution at wake_words/penny_v4.json if kept side-by-side —
+  # then update wake_penny_cutoff_idle/_idle_int/_session_int and wake_penny_window below to the
+  # v4 model's recommended values. That is the full extent of the swap, plus a rebuild.
+  wake_word_model: wake_words/penny.json
+  # Penny cutoff/window — single source of truth so the swap above is a one-line-per-value change.
+  # Base (idle) cutoff is read straight from the Penny manifest (0.90) since Penny has no dedicated
+  # calibration sweep yet (unlike Neo's 0.96/Riker's 0.90, both backed by held-out eval sweeps).
+  # The session/barge-in tier reuses an ALREADY-PROVEN quantized int from this file's own history
+  # (217 = 0.85, Neo's own loosest Sat1 tier) rather than inventing new arithmetic — flagged
+  # provisional pending the v4 model's own sweep. int(probability * 255): 0.90 -> 229, 0.85 -> 217.
+  wake_penny_cutoff_idle: "0.90"          # float form, for the models: list entry below
+  wake_penny_cutoff_idle_int: "229"       # 0.90 quantized — idle tier for the lambdas
+  wake_penny_cutoff_session_int: "217"    # 0.85 quantized — session/barge-in tier (provisional)
+  # Sliding window: 5 (NOT 8 — a window of 8 made the PE deaf; see memory
+  # wake-sliding-window-sizing.md, "known-good floor: 5", also what the kitchen Sat1 runs).
+  # Overridden inline in the models: entry below so it applies regardless of what the manifest
+  # JSON says (belt-and-suspenders — the manifest also carries 5).
+  wake_penny_window: "5"
 
 esphome:
   name: ha-voice-openai
@@ -80,18 +101,14 @@ esphome:
       # Start the wake word INDEPENDENT of Home Assistant. This device's voice loop runs over the
       # session-server WebSocket, not HA — but micro_wake_word was only started by
       # api.on_client_connected, so whenever the device wasn't adopted in HA the wake word was dead
-      # (no "Neo"). Start it here once voice_kit is up (~a few seconds after boot). The api handler
-      # below still (idempotently) starts it too, so an HA connection is a bonus, not a requirement.
+      # (no wake word). Start it here once voice_kit is up (~a few seconds after boot). The api
+      # handler below still (idempotently) starts it too, so an HA connection is a bonus, not a
+      # requirement.
       #
-      # micro_wake_word only auto-enables the FIRST model in `models:` on a device's very first
-      # boot (esphome/components/micro_wake_word/__init__.py: `default_enabled = i == 0`); every
-      # other model — riker_wake_word here — boots DISABLED and stays that way until something
-      # calls micro_wake_word.enable_model, at which point the enabled state is persisted to flash
-      # (streaming_model.cpp WakeWordModel::enable() saves to its own ESPPreferenceObject) and
-      # survives future reboots on its own. Call it here, every boot, before starting detection —
-      # cheap once already enabled/persisted, and it's what actually turns Riker on at all. Without
-      # this, Riker compiles, ships, and silently never detects.
-      - micro_wake_word.enable_model: riker_wake_word
+      # 2026-09-29: Penny-only build — back to a single model, so the dual-wake
+      # micro_wake_word.enable_model dance (needed only for the SECOND+ model in `models:`,
+      # esphome/components/micro_wake_word/__init__.py: `default_enabled = i == 0`) is gone.
+      # Penny is the sole/first model and auto-enables on first boot the way Neo alone used to.
       - delay: 4s
       - micro_wake_word.start:
           id: mww
@@ -166,10 +183,8 @@ api:
   on_client_connected:
     - lambda: id(init_in_progress) = false;
     - script.execute: control_leds
-    # Start micro_wake_word when API connects (ensures it's ready). Also re-assert riker_wake_word's
-    # enable — belt-and-suspenders alongside the on_boot call above, same reasoning (default_enabled
-    # only applies to the first model in the list).
-    - micro_wake_word.enable_model: riker_wake_word
+    # Start micro_wake_word when API connects (ensures it's ready). Penny-only build: no
+    # second-model enable_model call needed (see on_boot above).
     - micro_wake_word.start:
         id: mww
   on_client_disconnected:
@@ -1188,73 +1203,31 @@ micro_wake_word:
     gain_factor: 4
   stop_after_detection: false
   models:
-    # Primary wake word — driven by the ${wake_word_model} substitution above
-    # (now the custom "Neo" model). Neo/Riker dual-wake pilot (riker_migration_plan.md
-    # Phase 1 step 5): BOTH models are active during the trial so either name wakes the
-    # device. on_wake_word_detected below is a single component-level trigger that fires
-    # for whichever model matched — it doesn't branch on which one, so no change was
-    # needed there for "either word wakes." Only the per-model cutoff tiers need a second
-    # copy (see riker_wake_word below + the 4 set_probability_cutoff lambdas near
-    # voice_assistant_websocket's on_connected/on_disconnected/on_stopped/on_error).
+    # Primary (and only) wake word — driven by the ${wake_word_model} substitution above.
+    #
+    # 2026-09-29: Neo AND Riker dropped entirely — Penny is now the single wake word on every
+    # Neo satellite (this PE + both Sat1s). The dual-wake infrastructure (a second models: entry,
+    # the riker_wake_word id, its own set_probability_cutoff tier lambdas, the boot-time
+    # enable_model call) is removed outright rather than left dormant, per riker_migration_plan.md
+    # being superseded — see git history (275420d/3deb688 added Riker; this branch removes it)
+    # if that plan or Riker's tuning notes are ever needed again.
+    #
+    # Cutoff/window history for this slot: the original "Neo" model went 0.98 -> 0.90 (fixed
+    # barge-in, broke idle) -> 0.96 (fixed idle, broke barge-in) -> split by session state (see
+    # voice_assistant_websocket's on_connected/on_disconnected/on_stopped/on_error below) once it
+    # became clear ONE static cutoff can't serve both "strict enough idle" and "loose enough to
+    # hear the word over its own TTS residual." That same 2-tier (idle/session) split carries over
+    # unchanged below, now scoped to Penny. The window axis is independent of the cutoff axis
+    # (detection = mean(recent_probabilities) > cutoff, so widening the window silently RAISES the
+    # effective bar): windows of 12 then 8 were both tried for Neo, 12 made the PE deaf outright;
+    # this build goes straight to 5, the known-good floor the kitchen Sat1 has run reliably
+    # (memory: wake-sliding-window-sizing.md). See the substitutions block above for the
+    # single-source-of-truth cutoff/window values and the v4-model swap-in instructions.
     - model: ${wake_word_model}
       id: primary_wake_word
-      # Override the model's default 0.98 cutoff. 0.98 is great when idle but too strict to catch
-      # "Neo" over Neo's own loud playback (the XMOS AEC leaves residual that lowers the model's
-      # confidence) — that's the "had to say Neo 4x to barge in" problem. 0.90 makes barge-in reliable;
-      # trade-off is slightly more idle false-wakes (the flywheel + this knob manage it — raise toward
-      # 0.95 if false triggers get annoying, lower toward 0.85 if barge-in is still stubborn).
-      # 2026-08-01: raised to 0.96 — device was over-sensitive (too many idle false-wakes).
-      #
-      # 2026-08-26: STOP TUNING THIS KNOB FOR FALSE WAKES. The detection rule is
-      #   detected = sum(recent_probabilities) > probability_cutoff * sliding_window_size
-      # (streaming_model.cpp determine_detected) — i.e. the MEAN probability across the last N
-      # windows. That is two independent axes, and every fix so far has fought over just this one:
-      # 0.98 -> 0.90 fixed barge-in and broke idle, 0.90 -> 0.96 fixed idle and broke barge-in.
-      # 3c50006 finally split it by SESSION STATE, which is why this is still 0.96 while idle.
-      # The other axis — how SUSTAINED the detection must be — had never been touched:
-      # sliding_window_size was 5, and at feature_step_size 10 that is only ~50 ms of agreement,
-      # so any brief phonetic collision in ordinary conversation can pull the mean over. A spoken
-      # "Neo" lasts ~350-400 ms. Raised to 12 (~120 ms) in wake_words/neo.json instead, which
-      # suppresses transient trips WITHOUT raising the confidence bar.
-      #
-      # 2026-08-27: 12 OVERSHOT — flashed, and the PE then "almost never" heard a deliberate "Neo"
-      # (false wakes stopped too; it suppressed everything). The caveat above was the right worry
-      # with the wrong magnitude, and the error is in the sizing rule: what has to fit inside the
-      # window is NOT the length of the spoken word, it is the length of the model's CONFIDENCE
-      # PEAK, which is much shorter. At 12 the window averages that peak together with the
-      # low-probability frames on either side, so the mean never clears 0.96 even on a clean wake.
-      # Backed off to 8 (~80 ms) — still 60% more sustain than the original 5, but sized against
-      # the peak rather than the word. The kitchen Sat1 runs 5 and wakes reliably, so 5 is the
-      # known-good floor to fall back to if 8 is still deaf. Do NOT answer a deaf window by
-      # lowering the cutoff — that re-enters the yo-yo this whole comment exists to end.
-      probability_cutoff: 0.96
-    # Riker — second wake word, dual-wake pilot (riker_migration_plan.md Phase 1).
-    # v1 trained 2026-09-24 (10k Riker positives, 16 adversarial words x 500 samples each incl.
-    # striker/biker/hiker/Mike/Rick/etc, 10k training steps -- same step count as Neo's own
-    # recipe) scored recall 0.90 @ window 3/cutoff 0.90 with 'rick' FA 0.20-0.42 -- worse than
-    # Neo's own 0.989 baseline recall. **v2 (shipped here, trained 2026-09-25)** raised
-    # training_steps to 30k (3x) and oversampled/penalized specifically 'rick' and 'mike'
-    # (sampling_weight 12.0/penalty_weight 4.0 vs 4.0/2.0 for the other 14 adversarial words --
-    # see HEAVY_ADVERSARIAL_WORDS in ~/neo-wakeword/make_training_config_word.py) since those two,
-    # not 'striker', were what the v1 held-out eval actually flagged as the confusables. Full
-    # sweep: ~/neo-wakeword/out/riker_calibration_v2.json (v1's kept alongside as
-    # riker_calibration_v1.json / previous_riker_v1.tflite for the comparison).
-    # sliding_window_size 3 (below, riker.json) stays picked from DATA, not copied from Neo's 8:
-    # Riker's confidence peak is narrower than Neo's, so a WIDER window (5 or 8) measurably hurts
-    # recall here even though the raw peak-width/FWHM measurement suggested otherwise -- the
-    # empirical sweep overrides the heuristic. Do not "fix" this back to 8 without re-running it.
-    # cutoff 0.90 idle / 0.80 session-scoped barge-in (int 229 / 204 below), v2 @ window 3:
-    #   0.90 -> recall 0.947, ambient_faph 0.067, rick FA 0.00, striker FA 0.04 (idle stays quiet)
-    #   0.80 -> recall 0.962, ambient_faph 0.200, rick FA 0.02, striker FA 0.06
-    # (v1 at the same points was recall 0.90/0.95 with rick FA 0.20/0.42 -- v2 wins on both
-    # recall AND the rick confusable at matched ambient_faph). This PE build has only these 2
-    # cutoff tiers (idle/session) for either model -- the 3-tier idle/session/music-playing scheme
-    # some notes reference is Sat1-only (`update_wake_sensitivity`, a different repo/config,
-    # Phase 3 scope) and doesn't exist in this file for Neo either; nothing to map here.
-    - model: wake_words/riker.json
-      id: riker_wake_word
-      probability_cutoff: 0.9
-    # Extra triggers disabled for the Neo build — uncomment to also wake on these:
+      probability_cutoff: ${wake_penny_cutoff_idle}   # PROVISIONAL — from the Penny manifest, no sweep yet
+      sliding_window_size: ${wake_penny_window}
+    # Extra triggers disabled for this build — uncomment to also wake on these:
     # - model: hey_jarvis
     #   id: hey_jarvis
     # - model: hey_mycroft
@@ -1269,7 +1242,7 @@ micro_wake_word:
                 neo_intercom.is_active:
                   id: pe_intercom
         then:
-          # Barge-in FIRST — before the chime. If Neo is mid-reply, "Neo" must cut it in ~a WS
+          # Barge-in FIRST — before the chime. If mid-reply, "Penny" must cut it in ~a WS
           # round-trip, not ~1s later. A re-wake NEVER disconnects the session — interrupt() leaves
           # it RUNNING (and opens the mic for the follow-up) so your next request is heard right away.
           - if:
@@ -1356,9 +1329,9 @@ voice_assistant_websocket:
 
   # Auto-stop the session after this long with no speaker (bot) audio. While the
   # session is open the mic streams to the backend (billed audio + live listening),
-  # so keep this tight — re-wake with "Neo" for the next request. The old 120s was a
+  # so keep this tight — re-wake with "Penny" for the next request. The old 120s was a
   # band-aid for the wake-word re-arm bug (now fixed); 15s = a slightly roomier close
-  # than Alexa — re-wake with "Neo" for follow-ups. Accepts a time period ("15s") or raw ms.
+  # than Alexa — re-wake with "Penny" for follow-ups. Accepts a time period ("15s") or raw ms.
   auto_stop_inactivity_ms: 15s
 
   # Audio input (microphone) - reference to I2S audio input
@@ -1380,15 +1353,14 @@ voice_assistant_websocket:
         duration: 0.0s
     # Barge-in sensitivity, scoped to the session. The static probability_cutoff is a single knob
     # forced to serve two opposite jobs: strict enough that idle ambience doesn't false-wake, loose
-    # enough to catch "Neo" through the AEC residual of Neo's own playback. 0.98 -> 0.90 fixed
-    # barge-in, 0.90 -> 0.96 fixed false wakes, and each broke the other.
-    # Splitting it by state removes the conflict: stay strict (0.96) while idle, drop to the
-    # known-good 0.90 only for the duration of a session — which is the only time barge-in can
-    # happen anyway, and when the mic is already open and streaming.
+    # enough to catch the wake word through the AEC residual of its own playback. Splitting it by
+    # state removes the conflict: stay strict (idle) while idle, drop to the looser session tier
+    # only for the duration of a session — which is the only time barge-in can happen anyway, and
+    # when the mic is already open and streaming.
     # micro_wake_word exposes no YAML action for this, but WakeWordModel::set_probability_cutoff
-    # is public and the cutoff is quantised as int(probability * 255): 0.90 -> 229, 0.96 -> 244.
-    - lambda: id(primary_wake_word).set_probability_cutoff(229);   # 0.90 — barge-in over playback
-    - lambda: id(riker_wake_word).set_probability_cutoff(204);     # 0.80 — riker's session-scoped tier, re-derived from the v2 (rick/mike-weighted, 30k-step) model's own sweep (see calibrate_riker.py notes above)
+    # is public and the cutoff is quantised as int(probability * 255) — see the substitutions block
+    # (wake_penny_cutoff_idle_int / wake_penny_cutoff_session_int) for the single source of truth.
+    - lambda: id(primary_wake_word).set_probability_cutoff(${wake_penny_cutoff_session_int});   # session — barge-in over playback
   on_disconnected:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # turn ended → idle (ring off), NOT not_ready (red). Red is reserved for WiFi-down.
     - script.execute: control_leds
@@ -1400,8 +1372,7 @@ voice_assistant_websocket:
         id: media_mixing_input
         decibel_reduction: 0
         duration: 1.0s
-    - lambda: id(primary_wake_word).set_probability_cutoff(244);   # back to strict 0.96 when idle
-    - lambda: id(riker_wake_word).set_probability_cutoff(229);     # back to strict riker 0.90 when idle
+    - lambda: id(primary_wake_word).set_probability_cutoff(${wake_penny_cutoff_idle_int});   # back to strict idle
   on_stopped:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # turn ended → idle (ring off), NOT not_ready (red). Red is reserved for WiFi-down.
     - script.execute: control_leds
@@ -1410,8 +1381,7 @@ voice_assistant_websocket:
         id: media_mixing_input
         decibel_reduction: 0
         duration: 1.0s
-    - lambda: id(primary_wake_word).set_probability_cutoff(244);   # back to strict 0.96 when idle
-    - lambda: id(riker_wake_word).set_probability_cutoff(229);     # back to strict riker 0.90 when idle
+    - lambda: id(primary_wake_word).set_probability_cutoff(${wake_penny_cutoff_idle_int});   # back to strict idle
   on_error:
     - if:
         condition:
@@ -1426,13 +1396,12 @@ voice_assistant_websocket:
               duration: 1.0s
     # Deliberately OUTSIDE the init guard above: a stranded loose cutoff means the device
     # false-wakes on ambience forever, so restore it on every error path without exception.
-    - lambda: id(primary_wake_word).set_probability_cutoff(244);   # back to strict 0.96
-    - lambda: id(riker_wake_word).set_probability_cutoff(229);     # back to strict riker 0.90
+    - lambda: id(primary_wake_word).set_probability_cutoff(${wake_penny_cutoff_idle_int});   # back to strict idle
   # Wake-word enrollment mode (docs/wakeword_flywheel_plan.md Phase 3). The C++ owns the
   # mic-pin + 15-min safety cap + WS-drop restore; the YAML just disarms/re-arms the wake
-  # model so guided reps ("Neo, Neo, Neo...") don't self-trigger while streaming.
+  # model so guided reps ("Penny, Penny, Penny...") don't self-trigger while streaming.
   #
-  # 2026-09-27 FIX (empty-enrollment-WAV / orphan-coach bug): this used to call
+  # 2026-09-27 FIX (empty-enrollment-WAV / orphan-coach bug, a5099d6): this used to call
   # `micro_wake_word.stop()` here. micro_wake_word owns its mic access through its OWN
   # `microphone::MicrophoneSource`, whose `stop()` calls straight through to the shared
   # `Microphone::stop()` (esphome/components/microphone/microphone_source.cpp) with NO
@@ -1446,29 +1415,27 @@ voice_assistant_websocket:
   # from an I2S fault sharing the bus with active speaker (coach TTS) output is the leading theory,
   # though the mic-starvation on its own already explains the empty WAV regardless.
   #
-  # Fix: never stop mww here at all -- raise both models' cutoffs to (quantized) 1.0, i.e.
+  # Fix: never stop mww here at all -- raise the model's cutoff to (quantized) 1.0, i.e.
   # unreachable, the same session-scoped-cutoff mechanism already used for barge-in sensitivity
   # elsewhere in this file (WakeWordModel::set_probability_cutoff). mww keeps running (and keeps
-  # its OWN mic source open) throughout enrollment; a rep audibly matching "Neo"/"Riker" simply
-  # can never cross an impossible bar, so it can't self-trigger, and the shared mic is never
-  # touched. Restore to the normal IDLE cutoffs on stop (244/0.96 Neo, 229/0.90 Riker -- the same
-  # values the on_error/on_disconnected/on_stopped paths restore to).
+  # its OWN mic source open) throughout enrollment; a rep audibly matching "Penny" simply can
+  # never cross an impossible bar, so it can't self-trigger, and the shared mic is never touched.
+  # Restore to the normal idle cutoff on stop (the same value on_error/on_disconnected/on_stopped
+  # restore to).
   on_enroll_start:
     - lambda: id(wake_enrolling) = true;
     - logger.log:
-        format: "Enrollment start - raising wake cutoffs to unreachable (mic stays owned by voice_assistant_websocket, not stopped)"
+        format: "Enrollment start - raising wake cutoff to unreachable (mic stays owned by voice_assistant_websocket, not stopped)"
         level: INFO
     - lambda: |-
         id(primary_wake_word).set_probability_cutoff(255);
-        id(riker_wake_word).set_probability_cutoff(255);
   on_enroll_stop:
     - lambda: id(wake_enrolling) = false;
     - logger.log:
-        format: "Enrollment stop - restoring idle wake cutoffs"
+        format: "Enrollment stop - restoring idle wake cutoff"
         level: INFO
     - lambda: |-
-        id(primary_wake_word).set_probability_cutoff(244);   // back to strict 0.96
-        id(riker_wake_word).set_probability_cutoff(229);     // back to strict riker 0.90
+        id(primary_wake_word).set_probability_cutoff(${wake_penny_cutoff_idle_int});   // back to strict idle
 
 # Voice Kit Component - Voice PE Hardware (XMOS Firmware)
 # The XMOS XU316 chip has built-in audio processing support:
