@@ -43,6 +43,11 @@ config/mcp_servers.yaml
 secrets.yaml
 home-assistant-voice-pe/secrets.yaml
 
+# ESPHome build cache — lands here (repo root) instead of home-assistant-voice-pe/.esphome/
+# when the docker build mounts this repo root as /config (needed so ESP-IDF's git_describe
+# finds .git at the mount root). See home-assistant-voice-pe/.gitignore for the scoped copy.
+.esphome/
+
 # OS
 .DS_Store
 Thumbs.db
