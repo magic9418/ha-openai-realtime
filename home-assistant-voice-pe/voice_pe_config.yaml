@@ -29,7 +29,7 @@
 #    esphome upload voice_pe_config.yaml
 
 substitutions:
-  esp32_fw_version: neo-2026.09.29-penny-only.1
+  esp32_fw_version: neo-2026.09.29-penny-v4.1
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -60,24 +60,22 @@ substitutions:
   # tensor arena fails to allocate ("Failed to allocate tensors"). To fall back to a stock
   # trigger, set `okay_nabu`.
   #
-  # ⚠️ PROVISIONAL: wake_words/penny.{tflite,json} is the v2 PLACEHOLDER model (synthetic-trained,
-  # NOT real-voice validated — see the "status" field the training harness writes to
-  # ~/neo-wakeword/out/penny.json). A better v4 model is being trained in parallel and will ship
-  # as out/penny_v4.{tflite,json} with its own recommended cutoff/window. TO SWAP IT IN: overwrite
-  # wake_words/penny.tflite + wake_words/penny.json with the v4 files (zero YAML change beyond
-  # this comment), OR point this substitution at wake_words/penny_v4.json if kept side-by-side —
-  # then update wake_penny_cutoff_idle/_idle_int/_session_int and wake_penny_window below to the
-  # v4 model's recommended values. That is the full extent of the swap, plus a rebuild.
-  wake_word_model: wake_words/penny.json
+  # 2026-09-29: VALIDATED v4 model (wake_words/penny_v4.{tflite,json}) — supersedes the v2
+  # synthetic-only placeholder this file shipped with earlier the same day. Real-voice
+  # session-disjoint holdout eval: recall flat at 0.88 with ZERO false accepts across the whole
+  # 0.51-0.61 cutoff band at window 5 (the earlier "GATE FAILED" note on out/penny_v4.json was
+  # from a window=3 run with mis-cut clips — stale, not carried into the manifest vendored here).
+  # TO SWAP IN A FUTURE MODEL: point this substitution at the new manifest (or overwrite
+  # penny_v4.{tflite,json} in place), then update wake_penny_cutoff_idle/_idle_int/_session_int
+  # and wake_penny_window below to that model's own validated values. That is the full extent of
+  # the swap, plus a rebuild.
+  wake_word_model: wake_words/penny_v4.json
   # Penny cutoff/window — single source of truth so the swap above is a one-line-per-value change.
-  # Base (idle) cutoff is read straight from the Penny manifest (0.90) since Penny has no dedicated
-  # calibration sweep yet (unlike Neo's 0.96/Riker's 0.90, both backed by held-out eval sweeps).
-  # The session/barge-in tier reuses an ALREADY-PROVEN quantized int from this file's own history
-  # (217 = 0.85, Neo's own loosest Sat1 tier) rather than inventing new arithmetic — flagged
-  # provisional pending the v4 model's own sweep. int(probability * 255): 0.90 -> 229, 0.85 -> 217.
-  wake_penny_cutoff_idle: "0.90"          # float form, for the models: list entry below
-  wake_penny_cutoff_idle_int: "229"       # 0.90 quantized — idle tier for the lambdas
-  wake_penny_cutoff_session_int: "217"    # 0.85 quantized — session/barge-in tier (provisional)
+  # Both tiers stay INSIDE the validated 0.51-0.61 band (flat 0.88 recall, 0 false accepts) —
+  # never below 0.51. int(probability * 255): 0.61 -> 155, 0.56 -> 142.
+  wake_penny_cutoff_idle: "0.61"          # float form, for the models: list entry below
+  wake_penny_cutoff_idle_int: "155"       # 0.61 quantized — idle tier for the lambdas
+  wake_penny_cutoff_session_int: "142"    # 0.56 quantized — session/barge-in tier
   # Sliding window: 5 (NOT 8 — a window of 8 made the PE deaf; see memory
   # wake-sliding-window-sizing.md, "known-good floor: 5", also what the kitchen Sat1 runs).
   # Overridden inline in the models: entry below so it applies regardless of what the manifest
@@ -1225,7 +1223,7 @@ micro_wake_word:
     # single-source-of-truth cutoff/window values and the v4-model swap-in instructions.
     - model: ${wake_word_model}
       id: primary_wake_word
-      probability_cutoff: ${wake_penny_cutoff_idle}   # PROVISIONAL — from the Penny manifest, no sweep yet
+      probability_cutoff: ${wake_penny_cutoff_idle}   # validated v4 real-voice eval (0.51-0.61 band)
       sliding_window_size: ${wake_penny_window}
     # Extra triggers disabled for this build — uncomment to also wake on these:
     # - model: hey_jarvis

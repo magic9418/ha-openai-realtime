@@ -3,13 +3,13 @@
   "wake_word": "Penny",
   "author": "magic9418",
   "website": "https://github.com/magic9418/ha-openai-realtime",
-  "model": "penny.tflite",
+  "model": "penny_v4.tflite",
   "trained_languages": [
     "en"
   ],
   "version": 2,
   "micro": {
-    "probability_cutoff": 0.9,
+    "probability_cutoff": 0.61,
     "feature_step_size": 10,
     "sliding_window_size": 5,
     "tensor_arena_size": 45000,
