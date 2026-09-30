@@ -29,7 +29,7 @@
 #    esphome upload voice_pe_config.yaml
 
 substitutions:
-  esp32_fw_version: neo-2026.09.30-penny-dropin-stack-v7
+  esp32_fw_version: neo-2026.09.30-penny-voice-hangup-v8
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -1242,6 +1242,9 @@ micro_wake_word:
     #   id: hey_mycroft
   vad:
   on_wake_word_detected:
+    - lambda: |-
+        if (!id(master_mute_switch).state)
+          esphome::neo_intercom::NeoIntercom::local_voice_command_wake();
     - if:
         condition:
           and:
