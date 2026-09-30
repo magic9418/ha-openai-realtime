@@ -29,7 +29,7 @@
 #    esphome upload voice_pe_config.yaml
 
 substitutions:
-  esp32_fw_version: neo-2026.09.30-penny-dropin-dial-v5
+  esp32_fw_version: neo-2026.09.30-penny-dropin-caller-v6
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -143,10 +143,11 @@ esp32:
       CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST: "y"
       CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY: "y"
       CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
-      # Intercom keeps one pinned-TLS control socket open. Allocate its TLS and
-      # WebSocket buffers only while they are actively carrying a frame so the
-      # I2S speaker can still obtain DMA-capable internal RAM when Neo replies.
-      CONFIG_MBEDTLS_DYNAMIC_BUFFER: "y"
+      # Intercom keeps one pinned-TLS control socket open. TLS lives in PSRAM;
+      # WebSocket frame buffers remain dynamic to conserve internal DMA RAM.
+      # Keep each socket's TLS record buffers alive in external RAM. Dynamic
+      # record allocation is being isolated after live intercom MAC failures.
+      CONFIG_MBEDTLS_DYNAMIC_BUFFER: "n"
       CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN: "4096"
       CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER: "y"
       CONFIG_WS_DYNAMIC_BUFFER: "y"
