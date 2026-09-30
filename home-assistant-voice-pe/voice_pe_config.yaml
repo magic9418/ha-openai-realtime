@@ -29,7 +29,7 @@
 #    esphome upload voice_pe_config.yaml
 
 substitutions:
-  esp32_fw_version: neo-2026.09.29-penny-v4.2
+  esp32_fw_version: neo-2026.09.30-penny-intercom-auth-v1
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -1315,7 +1315,7 @@ neo_intercom:
   hardware_identity: voice-pe-xmos-v1
   control_url: !secret intercom_control_url
   media_url: !secret intercom_media_url
-  auth_token: !secret intercom_device_bearer
+  auth_token: !secret intercom_device_bearer_office
   pinned_ca: !secret intercom_server_ca_pem
   microphone: i2s_mics
   speaker: announcement_resampling_speaker
