@@ -341,6 +341,10 @@ class VoiceAssistantWebSocket : public Component {
   bool pending_start_{false};
   bool pending_disconnect_{false};  // Flag to disconnect in loop() (cannot be called from websocket task)
   bool pending_reboot_{false};  // Flag to reboot in loop() (server {"type":"reboot"} frame; cannot reboot from websocket task)
+  // Protected by deferred_lock_; consumed once on the main task after teardown.
+  std::string pending_dropin_room_;
+  std::string pending_dropin_request_id_;
+  uint32_t pending_dropin_deadline_ms_{0};
   bool reconnect_pending_{false};
   // Set alongside reconnect_pending_ when connect_websocket_() has to tear a stale client down
   // before it can honour a FRESH WAKE. It has to be a separate flag because both websocket event

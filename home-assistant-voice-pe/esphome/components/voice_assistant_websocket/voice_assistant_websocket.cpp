@@ -4,6 +4,10 @@
 #include "esphome/components/audio/audio.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/application.h"  // App.safe_reboot() for server-requested reboot
+#include "esphome/components/json/json_util.h"
+#ifdef USE_NEO_INTERCOM
+#include "esphome/components/neo_intercom/neo_intercom.h"
+#endif
 #include <cstring>
 #include <algorithm>
 #include <queue>
@@ -45,6 +49,29 @@ void VoiceAssistantWebSocket::loop() {
   // (main) task: the triggers run mixer_speaker.apply_ducking, the LED ring's perform() and
   // media_player.stop, none of which are safe from a websocket event handler. See DeferredEvent.
   this->dispatch_deferred_();
+
+#ifdef USE_NEO_INTERCOM
+  // Dial only on the authenticated intercom connection, after assistant teardown.
+  if (this->state_ == VOICE_ASSISTANT_WEBSOCKET_IDLE && this->websocket_client_ == nullptr &&
+      this->speaker_ != nullptr && this->speaker_->is_stopped()) {
+    std::string room, request_id;
+    if (this->deferred_lock_ != nullptr && xSemaphoreTake(this->deferred_lock_, 0) == pdTRUE) {
+      if (!this->pending_dropin_request_id_.empty()) {
+        if (static_cast<int32_t>(millis() - this->pending_dropin_deadline_ms_) >= 0) {
+          ESP_LOGW(TAG, "Drop In source did not become ready before deadline");
+          this->pending_dropin_request_id_.clear();
+          this->pending_dropin_room_.clear();
+        } else if (neo_intercom::NeoIntercom::dropin_source_ready()) {
+          room.swap(this->pending_dropin_room_);
+          request_id.swap(this->pending_dropin_request_id_);
+        }
+      }
+      xSemaphoreGive(this->deferred_lock_);
+    }
+    if (!request_id.empty() && !neo_intercom::NeoIntercom::request_drop_in_room(room, request_id))
+      ESP_LOGW(TAG, "Drop In dial could not be sent; request not replayed");
+  }
+#endif
 
   // Handle pending reboot (must be done in main task, not websocket task). Set by the WS
   // text-frame handler on a server {"type":"reboot"} frame. App.safe_reboot() flushes
@@ -1328,6 +1355,34 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
           this->explicit_disconnect_ = true;
           // Stop the voice assistant (will go to idle mode)
           this->stop();
+        } else if (message.find("\"type\":\"drop_in\"") != std::string::npos ||
+                   message.find("\"type\": \"drop_in\"") != std::string::npos) {
+#ifdef USE_NEO_INTERCOM
+          bool valid = false;
+          std::string room, request_id;
+          json::parse_json(message, [&](JsonObject root) {
+            const char *type = root["type"];
+            const char *target = root["target_room"];
+            const char *request = root["request_id"];
+            if (type == nullptr || std::strcmp(type, "drop_in") != 0 || target == nullptr || request == nullptr)
+              return false;
+            room = target;
+            request_id = request;
+            valid = !room.empty() && room.size() <= 64 && !request_id.empty() && request_id.size() <= 128;
+            return valid;
+          });
+          if (valid && this->deferred_lock_ != nullptr && xSemaphoreTake(this->deferred_lock_, pdMS_TO_TICKS(2)) == pdTRUE) {
+            this->pending_dropin_room_ = room;
+            this->pending_dropin_request_id_ = request_id;
+            this->pending_dropin_deadline_ms_ = millis() + 5000;
+            xSemaphoreGive(this->deferred_lock_);
+            this->stop();
+          } else {
+            ESP_LOGW(TAG, "Rejected Drop In instruction");
+          }
+#else
+          ESP_LOGW(TAG, "Drop In requested on firmware without intercom");
+#endif
         } else if (message.find("\"type\":\"reboot\"") != std::string::npos ||
                    message.find("\"type\": \"reboot\"") != std::string::npos) {
           // Server-requested device reboot (Console "Reboot" button -> session-server
