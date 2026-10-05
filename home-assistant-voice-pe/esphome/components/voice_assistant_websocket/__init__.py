@@ -1,3 +1,5 @@
+import os
+
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import automation
@@ -16,6 +18,13 @@ VoiceAssistantWebSocket = voice_assistant_websocket_ns.class_(
 )
 
 CONF_SERVER_URL = "server_url"
+# Detector channel/gain (what micro_wake_word consumes) for wake-trigger capture, plus metadata
+# reported with each captured trigger (wake_trigger_capture.h).
+CONF_ENROLLMENT_WAKE_CHANNEL = "enrollment_wake_channel"
+CONF_ENROLLMENT_WAKE_GAIN = "enrollment_wake_gain_factor"
+CONF_WAKE_TRIGGER_MODEL = "wake_trigger_model"
+CONF_WAKE_TRIGGER_FW = "wake_trigger_fw"
+CONF_WAKE_TRIGGER_WINDOW = "wake_trigger_window"
 CONF_VOICE_ASSISTANT_WEBSOCKET = "voice_assistant_websocket"
 CONF_ON_CONNECTED = "on_connected"
 CONF_ON_DISCONNECTED = "on_disconnected"
@@ -29,6 +38,12 @@ CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(VoiceAssistantWebSocket),
         cv.Required(CONF_SERVER_URL): cv.string,
+        cv.Optional(CONF_ENROLLMENT_WAKE_CHANNEL, default=1): cv.int_range(min=0, max=1),
+        cv.Optional(CONF_ENROLLMENT_WAKE_GAIN, default=4): cv.int_range(min=1, max=64),
+        # Model path or name; only the basename without extension is reported (e.g. penny_v5_oct1).
+        cv.Optional(CONF_WAKE_TRIGGER_MODEL, default="unknown"): cv.string,
+        cv.Optional(CONF_WAKE_TRIGGER_FW, default="unknown"): cv.string,
+        cv.Optional(CONF_WAKE_TRIGGER_WINDOW, default=0): cv.int_range(min=0, max=255),
         cv.Optional(CONF_MICROPHONE): cv.use_id(microphone.Microphone),
         cv.Optional(CONF_SPEAKER): cv.use_id(speaker.Speaker),
         # Auto-stop the session after this long with no speaker (bot) audio.
@@ -64,6 +79,15 @@ async def to_code(config):
         )
     
     cg.add(var.set_server_url(config[CONF_SERVER_URL]))
+    cg.add(var.set_enrollment_wake_channel(config[CONF_ENROLLMENT_WAKE_CHANNEL]))
+    cg.add(var.set_enrollment_wake_gain_factor(config[CONF_ENROLLMENT_WAKE_GAIN]))
+    cg.add(
+        var.set_wake_trigger_meta(
+            os.path.splitext(os.path.basename(config[CONF_WAKE_TRIGGER_MODEL]))[0],
+            config[CONF_WAKE_TRIGGER_FW],
+            config[CONF_WAKE_TRIGGER_WINDOW],
+        )
+    )
     cg.add(
         var.set_auto_stop_inactivity_ms(
             config[CONF_AUTO_STOP_INACTIVITY_MS].total_milliseconds

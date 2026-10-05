@@ -17,6 +17,7 @@
 #include <vector>
 #include <queue>
 #include <atomic>
+#include "wake_trigger_capture.h"
 
 // Barge-in policy toggle (see on_microphone_data_):
 //   0 = DEFAULT half-duplex — mic muted while Neo speaks; barge-in is via the wake word ("Neo").
@@ -49,6 +50,16 @@ class VoiceAssistantWebSocket : public Component {
   // place the task is asked to exit and is joined.
   void on_shutdown() override;
 
+  // Detector channel/gain micro_wake_word consumes (the wake-trigger capture converts the shared mic
+  // frames exactly like it: channel select + Q31->Q25 gain/clamp). PE: channel 1, gain 4.
+  void set_enrollment_wake_channel(uint8_t channel) { this->enrollment_wake_channel_ = channel; }
+  void set_enrollment_wake_gain_factor(uint8_t gain) { this->enrollment_wake_gain_factor_ = gain; }
+  // Wake-trigger capture metadata (compile-time facts about the detector; see capture_wake_trigger).
+  void set_wake_trigger_meta(const std::string &model, const std::string &fw, uint8_t window) {
+    this->wt_model_ = model;
+    this->wt_fw_ = fw;
+    this->wt_window_ = window;
+  }
   void set_server_url(const std::string &url) { this->server_url_ = url; }
   void set_microphone(microphone::Microphone *mic) { this->microphone_ = mic; }
   void set_speaker(speaker::Speaker *spkr) { this->speaker_ = spkr; }
@@ -60,6 +71,14 @@ class VoiceAssistantWebSocket : public Component {
   void stop();
   void request_start();
   void interrupt();  // Send interrupt message to server and stop speaker
+
+  // Wake-trigger capture (see wake_trigger_capture.h). MAIN LOOP only. The YAML wake-word handler
+  // calls this at the moment of detection, immediately BEFORE voice_assistant_websocket.start
+  // (bargein=false) or .interrupt (bargein=true): it freezes the last 2000 ms of detector-channel
+  // audio and queues it for upload after the session's `wake` / `interrupt` frame. `cutoff` and
+  // `regime` are what the YAML knows was active at detection. No-op if the feature is disabled
+  // (PSRAM alloc failed), enrolling, or a previous upload is still in flight.
+  void capture_wake_trigger(bool bargein, uint8_t cutoff, const char *regime);
 
   // Wake-boundary / flywheel control messages (see docs/firmware_guards_plan.md &
   // docs/wakeword_flywheel_plan.md). Each sends a JSON text frame to the server;
@@ -113,7 +132,11 @@ class VoiceAssistantWebSocket : public Component {
   // INVARIANT: a frame sent from the MAIN LOOP or the MIC TASK must pass a bounded ticks_to_wait.
   // portMAX_DELAY on the main task parks every other ESPHome component (LEDs, mixer, watchdog)
   // behind one TCP write; on the mic task it starves micro_wake_word's producer ring.
-  void send_text_frame_(const char *json, TickType_t ticks_to_wait = portMAX_DELAY);
+  bool send_text_frame_(const char *json, TickType_t ticks_to_wait = portMAX_DELAY);
+  // ---- wake-trigger capture internals -------------------------------------------------------
+  void wake_trigger_init_();
+  void wake_trigger_loop_();   // main loop: paced upload state machine
+  void wake_trigger_abort_() { this->wt_state_.store(WT_NONE); }  // any task; just drops the job
   void enter_enrollment_();                 // pin mic open, disarm wake+stop models
   void exit_enrollment_();                  // restore normal wake/stop-model operation
   void send_audio_chunk_(const uint8_t *data, size_t len);
@@ -374,6 +397,28 @@ class VoiceAssistantWebSocket : public Component {
 
   // Enrollment mode: mic pinned open + streaming, wake/stop models disarmed by YAML.
   // Auto-restores on {"enroll","stop"}, WS drop, or the 15-min safety cap.
+  // Wake-trigger capture state. Ring/snapshot/scratch are ONE PSRAM block (WT_ALLOC_BYTES), allocated
+  // once in setup(); wt_enabled_ stays false (feature off, never internal RAM) if that fails.
+  enum : uint8_t { WT_NONE = 0, WT_WAIT_MARKER = 1, WT_SENDING = 2 };
+  static const uint32_t WT_MARKER_TIMEOUT_MS = 8000;  // give up if the wake/interrupt frame never goes out
+  static const uint32_t WT_COLD_SETTLE_MS = 250;      // after `hello`: let the look-back burst start first
+  static const uint32_t WT_PACE_MS = 20;              // min gap between upload frames
+  WakeTriggerRing wt_ring_;
+  bool wt_enabled_{false};
+  std::atomic<uint8_t> wt_state_{WT_NONE};
+  std::atomic<bool> wt_marker_{false};   // set once the session's wake/interrupt frame is on the wire
+  bool wt_bargein_{false};
+  uint8_t wt_cutoff_{0};
+  char wt_regime_[12]{};
+  uint32_t wt_captured_ms_{0};
+  uint32_t wt_ready_ms_{0};
+  uint32_t wt_next_ms_{0};
+  size_t wt_seq_{0};
+  std::string wt_model_{"unknown"};
+  std::string wt_fw_{"unknown"};
+  uint8_t wt_window_{0};
+  uint8_t enrollment_wake_channel_{1};
+  uint8_t enrollment_wake_gain_factor_{4};
   bool enrolling_{false};
   uint32_t enroll_start_time_{0};
   static const uint32_t ENROLL_MAX_MS = 15 * 60 * 1000;  // 15-min hard safety cap

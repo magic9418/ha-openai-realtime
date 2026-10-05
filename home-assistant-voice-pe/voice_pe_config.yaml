@@ -29,7 +29,7 @@
 #    esphome upload voice_pe_config.yaml
 
 substitutions:
-  esp32_fw_version: neo-2026.10.01-penny-trained-v9
+  esp32_fw_version: neo-2026.10.04-penny-trigger-v10
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -1242,6 +1242,9 @@ micro_wake_word:
                   - voice_assistant_websocket.is_bot_speaking:
                       id: voice_assistant_ws
               then:
+                # Wake-trigger capture (barge-in): freeze the detector's last 2 s NOW; uploaded after
+                # the `interrupt` frame. In-session cutoff = ${wake_penny_cutoff_session_int}.
+                - lambda: id(voice_assistant_ws).capture_wake_trigger(true, ${wake_penny_cutoff_session_int}, "session");
                 - voice_assistant_websocket.interrupt:
                     id: voice_assistant_ws
           # Cold wake: START the session BEFORE the chime, so the WS connect runs *underneath* the
@@ -1256,6 +1259,9 @@ micro_wake_word:
                   voice_assistant_websocket.is_running:
                     id: voice_assistant_ws
               then:
+                # Wake-trigger capture (cold wake): freeze the detector's last 2 s NOW (before start);
+                # uploaded after the session's `wake` frame. Idle cutoff = ${wake_penny_cutoff_idle_int}.
+                - lambda: id(voice_assistant_ws).capture_wake_trigger(false, ${wake_penny_cutoff_idle_int}, "idle");
                 - voice_assistant_websocket.start:
                     id: voice_assistant_ws
           # NEO: wake silently — no wake chime (parity with the Sat1; Matt doesn't want Neo to chime on
@@ -1325,6 +1331,15 @@ voice_assistant_websocket:
 
   # Audio input (microphone) - reference to I2S audio input
   microphone: i2s_mics
+
+  # Wake-trigger capture: the detector's own view of the room. channel/gain MUST equal the
+  # micro_wake_word `microphone:` block above (channels: 1, gain_factor: 4) so the uploaded audio is
+  # exactly what the model scored. Model name = basename of ${wake_word_model}.
+  enrollment_wake_channel: 1
+  enrollment_wake_gain_factor: 4
+  wake_trigger_model: ${wake_word_model}
+  wake_trigger_window: ${wake_penny_window}
+  wake_trigger_fw: ${esp32_fw_version}
   
   # Audio output - use resampler speaker (media_player uses this for volume control)
   # We resample 24kHz -> 48kHz in code, then send to resampler which passes through

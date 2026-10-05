@@ -34,6 +34,7 @@ void VoiceAssistantWebSocket::setup() {
   if (this->ws_client_lock_ == nullptr) this->ws_client_lock_ = xSemaphoreCreateMutex();
   this->preroll_init_();     // pre-allocate the PSRAM mic look-back (front-of-command clip fix)
   this->uplink_init_();      // PSRAM uplink ring + the one sender task (see the header INVARIANT)
+  this->wake_trigger_init_();  // PSRAM detector-audio ring for wake-trigger capture (never internal RAM)
   this->state_ = VOICE_ASSISTANT_WEBSOCKET_IDLE;
   
   // Register microphone data callback
@@ -49,6 +50,8 @@ void VoiceAssistantWebSocket::loop() {
   // (main) task: the triggers run mixer_speaker.apply_ducking, the LED ring's perform() and
   // media_player.stop, none of which are safe from a websocket event handler. See DeferredEvent.
   this->dispatch_deferred_();
+  // Paced wake-trigger upload (<=1 frame per iteration). Main task only - never the mic task.
+  this->wake_trigger_loop_();
 
 #ifdef USE_NEO_INTERCOM
   // Dial only on the authenticated intercom connection, after assistant teardown.
@@ -332,6 +335,7 @@ void VoiceAssistantWebSocket::stop() {
   }
   
   ESP_LOGI(TAG, "Stopping Voice Assistant WebSocket...");
+  this->wake_trigger_abort_();  // session ending: drop any queued/in-flight trigger upload
   this->audio_transport_ready_ = false;
   this->state_ = VOICE_ASSISTANT_WEBSOCKET_STOPPING;
   
@@ -1038,6 +1042,15 @@ void VoiceAssistantWebSocket::report_audio_free_(bool force) {
 }
 
 void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &data) {
+  // WAKE-TRIGGER RING. First thing, before every early return below (half-duplex bot-speaking drop,
+  // wake-chime gate, ...): the detector hears the room continuously, including while Neo speaks (that
+  // is exactly the barge-in case), so this ring must see every frame. Detector channel + gain, same
+  // conversion micro_wake_word applies. Cheap: one pass over the frames, no allocation, lock-free
+  // single producer. Skipped during enrollment (the wake word is disarmed, nothing to explain).
+  if (this->wt_enabled_ && !this->enrolling_) {
+    this->wt_ring_.push_stereo32(reinterpret_cast<const int32_t *>(data.data()), data.size() / 8,
+                                 this->enrollment_wake_channel_, this->enrollment_wake_gain_factor_);
+  }
   // Only stream if connected. Normally we stream only during a RUNNING session — BUT during
   // enrollment ("teach me my voice") there is no wake-session: the mic is pinned open with wake
   // disarmed, and the server needs every rep frame to build the training WAV. Without the
@@ -1157,12 +1170,139 @@ bool VoiceAssistantWebSocket::is_bot_speaking() const {
   return time_since_last_audio < 500;  // 500ms threshold
 }
 
-void VoiceAssistantWebSocket::send_text_frame_(const char *json, TickType_t ticks_to_wait) {
+// ---- Wake-trigger capture ------------------------------------------------------------------
+// Uploads the ~2 s of DETECTOR-channel audio that fired the wake word, so false wakes can be studied
+// (and retrained on) from the audio the model actually scored. Flow:
+//   YAML on_wake_word_detected -> capture_wake_trigger(): snapshot the ring (main loop, ~1 memcpy of
+//   64 KB, mic task never blocked) and queue the job -> the session's `wake` (cold, sent from the WS
+//   task at CONNECTED) / `interrupt` (barge-in, sent from interrupt()) frame goes out and sets
+//   wt_marker_ -> wake_trigger_loop_() sends start + 16 chunks + end, <=1 frame per loop iteration,
+//   >=WT_PACE_MS apart, so the live mic uplink is never starved. Any session end/disconnect drops it.
+void VoiceAssistantWebSocket::wake_trigger_init_() {
+#ifdef USE_ESP_IDF
+  // ONE PSRAM block. Deliberately NO internal-RAM fallback: the PE has a history of internal-heap
+  // starvation, and this feature is diagnostics - it must never cost the device a byte of SRAM.
+  uint8_t *mem = static_cast<uint8_t *>(heap_caps_malloc(WT_ALLOC_BYTES, MALLOC_CAP_SPIRAM));
+  if (mem == nullptr) {
+    ESP_LOGE(TAG, "Wake-trigger capture DISABLED: PSRAM alloc of %u bytes failed", (unsigned) WT_ALLOC_BYTES);
+    return;
+  }
+  if (!this->wt_ring_.attach(mem)) return;
+  this->wt_enabled_ = true;
+  ESP_LOGI(TAG, "Wake-trigger capture ready: %u B PSRAM (ring %u + snapshot %u + scratch %u), %u B PSRAM free",
+           (unsigned) WT_ALLOC_BYTES, (unsigned) WT_RING_BYTES, (unsigned) WT_BYTES, (unsigned) WT_JSON_BYTES,
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+#endif
+}
+
+void VoiceAssistantWebSocket::capture_wake_trigger(bool bargein, uint8_t cutoff, const char *regime) {
+  if (!this->wt_enabled_ || this->enrolling_) return;
+  if (this->wt_state_.load() != WT_NONE) {
+    ESP_LOGW(TAG, "Wake trigger: previous upload still in flight, skipping this capture");
+    return;
+  }
+  // The newest WT_BYTES ending at this instant: the main-loop wake callback runs within a loop tick
+  // of micro_wake_word's detection, and the ring is fed by the same mic stream the detector reads.
+  if (!this->wt_ring_.snapshot()) {
+    ESP_LOGW(TAG, "Wake trigger: ring not full yet (%u/%u B) or overrun; no capture",
+             (unsigned) this->wt_ring_.filled_bytes(), (unsigned) WT_BYTES);
+    return;
+  }
+  this->wt_bargein_ = bargein;
+  this->wt_cutoff_ = cutoff;
+  snprintf(this->wt_regime_, sizeof(this->wt_regime_), "%s", regime != nullptr ? regime : "fixed");
+  this->wt_captured_ms_ = millis();
+  this->wt_ready_ms_ = 0;
+  this->wt_seq_ = 0;
+  this->wt_marker_ = false;
+  this->wt_state_.store(WT_WAIT_MARKER);
+  ESP_LOGI(TAG, "Wake trigger captured (%s, cutoff %u, regime %s)", bargein ? "bargein" : "cold",
+           (unsigned) cutoff, this->wt_regime_);
+}
+
+void VoiceAssistantWebSocket::wake_trigger_loop_() {
+#ifdef USE_ESP_IDF
+  const uint8_t st = this->wt_state_.load();
+  if (st == WT_NONE) return;
+  const uint32_t now = millis();
+  // Session must still be alive. A cold job is queued BEFORE start(), so STARTING is fine for it.
+  const auto vs = this->state_;
+  const bool alive = this->wt_bargein_
+                         ? (vs == VOICE_ASSISTANT_WEBSOCKET_RUNNING && this->is_connected())
+                         : ((vs == VOICE_ASSISTANT_WEBSOCKET_STARTING) ||
+                            (vs == VOICE_ASSISTANT_WEBSOCKET_RUNNING && this->is_connected()));
+  if (!alive || this->websocket_client_ == nullptr) {
+    this->wt_state_.store(WT_NONE);  // quiet abort: session ended / WS dropped
+    return;
+  }
+  char *buf = this->wt_ring_.json_buf();
+  if (st == WT_WAIT_MARKER) {
+    if ((now - this->wt_captured_ms_) > WT_MARKER_TIMEOUT_MS) {
+      this->wt_state_.store(WT_NONE);
+      return;
+    }
+    if (!this->wt_marker_.load()) return;
+    if (!this->wt_bargein_) {
+      // Cold: the WS only just opened. Wait for the server's `hello` (uplink released) and a short
+      // settle so the look-back burst is already moving, and for the uplink ring to drain (or 1 s) -
+      // an earlier design that overlapped bursts with inbound frames dropped the transport.
+      if (!this->audio_transport_ready_.load()) return;
+      if (this->wt_ready_ms_ == 0) this->wt_ready_ms_ = now;
+      const uint32_t since = now - this->wt_ready_ms_;
+      if (since < WT_COLD_SETTLE_MS) return;
+      if (this->uplink_fill_ > 2 * UPLINK_SEND_CHUNK && since < WT_COLD_SETTLE_MS + 1000) return;
+    }
+    const int n = snprintf(
+        buf, WT_JSON_BYTES,
+        "{\"type\":\"wake_trigger_start\",\"kind\":\"%s\",\"sample_rate\":%u,\"samples\":%u,\"chunks\":%u,"
+        "\"channel\":%u,\"gain_factor\":%u,\"cutoff\":%u,\"window\":%u,\"regime\":\"%s\",\"model\":\"%s\","
+        "\"fw\":\"%s\"}",
+        this->wt_bargein_ ? "bargein" : "cold", (unsigned) WT_SAMPLE_RATE, (unsigned) WT_SAMPLES,
+        (unsigned) wt_chunk_count(WT_BYTES), (unsigned) this->enrollment_wake_channel_,
+        (unsigned) this->enrollment_wake_gain_factor_, (unsigned) this->wt_cutoff_, (unsigned) this->wt_window_,
+        this->wt_regime_, this->wt_model_.c_str(), this->wt_fw_.c_str());
+    if (n <= 0 || size_t(n) >= WT_JSON_BYTES ||
+        esp_websocket_client_send_text(this->websocket_client_, buf, n, pdMS_TO_TICKS(50)) != n) {
+      ESP_LOGW(TAG, "Wake trigger: start frame not sent; dropping upload");
+      this->wt_state_.store(WT_NONE);
+      return;
+    }
+    ESP_LOGI(TAG, "Wake trigger upload begin: %s", buf);
+    this->wt_seq_ = 0;
+    this->wt_next_ms_ = now + WT_PACE_MS;
+    this->wt_state_.store(WT_SENDING);
+    return;
+  }
+  // WT_SENDING: one frame per loop iteration, >= WT_PACE_MS apart.
+  if ((int32_t)(now - this->wt_next_ms_) < 0) return;
+  const size_t chunks = wt_chunk_count(WT_BYTES);
+  int n;
+  if (this->wt_seq_ < chunks) {
+    n = (int) wt_build_chunk_json(this->wt_ring_.snapshot_data(), WT_BYTES, this->wt_seq_, buf, WT_JSON_BYTES);
+  } else {
+    n = snprintf(buf, WT_JSON_BYTES, "{\"type\":\"wake_trigger_end\",\"samples\":%u}", (unsigned) WT_SAMPLES);
+  }
+  if (n <= 0 || esp_websocket_client_send_text(this->websocket_client_, buf, n, pdMS_TO_TICKS(50)) != n) {
+    ESP_LOGW(TAG, "Wake trigger: frame %u not sent; aborting upload", (unsigned) this->wt_seq_);
+    this->wt_state_.store(WT_NONE);
+    return;
+  }
+  if (this->wt_seq_ >= chunks) {
+    ESP_LOGI(TAG, "Wake trigger upload complete (%u chunks)", (unsigned) chunks);
+    this->wt_state_.store(WT_NONE);
+    return;
+  }
+  this->wt_seq_++;
+  this->wt_next_ms_ = now + WT_PACE_MS;
+#endif
+}
+
+bool VoiceAssistantWebSocket::send_text_frame_(const char *json, TickType_t ticks_to_wait) {
   // Shared JSON text-frame sender for all control messages (interrupt / wake / mic_flush /
   // false_flag / button_cancel). No-op (with a warning) if the WS isn't connected.
   if (!this->is_connected() || this->websocket_client_ == nullptr) {
     ESP_LOGW(TAG, "Cannot send control frame '%s' - not connected", json);
-    return;
+    return false;
   }
   int sent = esp_websocket_client_send_text(this->websocket_client_, json, strlen(json), ticks_to_wait);
   if (sent < 0) {
@@ -1170,6 +1310,7 @@ void VoiceAssistantWebSocket::send_text_frame_(const char *json, TickType_t tick
   } else {
     ESP_LOGI(TAG, "Sent control frame: %s", json);
   }
+  return sent >= 0;
 }
 
 void VoiceAssistantWebSocket::send_false_flag() {
@@ -1243,6 +1384,8 @@ void VoiceAssistantWebSocket::interrupt() {
     ESP_LOGW(TAG, "Failed to send interrupt message");
   } else {
     ESP_LOGI(TAG, "Interrupt message sent successfully");
+    // A barge-in trigger snapshot may now follow the interrupt frame (paced by the main loop).
+    if (this->wt_state_.load() == WT_WAIT_MARKER && this->wt_bargein_) this->wt_marker_ = true;
     // Stop speaker + drop the backlog atomically so buffered speech stops immediately on interrupt
     // (and the main-task drain can't re-feed stale bytes into the speaker after the stop).
     this->audio_ring_flush_and_stop_speaker_();
@@ -1303,6 +1446,9 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       // (A re-wake mid-session doesn't reconnect, so this is one wake per session — a
       // known limitation noted in docs/wakeword_flywheel_plan.md.)
       this->send_text_frame_("{\"type\":\"wake\"}");
+      // A cold-wake trigger snapshot may now follow (main loop paces it; see wake_trigger_loop_).
+      if (this->wt_state_.load() == WT_WAIT_MARKER && !this->wt_bargein_ && this->is_connected())
+        this->wt_marker_ = true;
 
       this->defer_event_(DeferredEvent::EV_STATE_CALLBACK, this->state_);
 
@@ -1313,6 +1459,7 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       break;
       
     case WEBSOCKET_EVENT_DISCONNECTED:
+      this->wake_trigger_abort_();
       ESP_LOGW(TAG, "WebSocket disconnected");
       this->state_ = VOICE_ASSISTANT_WEBSOCKET_DISCONNECTED;
 
