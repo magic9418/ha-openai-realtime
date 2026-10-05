@@ -29,7 +29,7 @@
 #    esphome upload voice_pe_config.yaml
 
 substitutions:
-  esp32_fw_version: neo-2026.09.30-penny-voice-hangup-v8
+  esp32_fw_version: neo-2026.10.01-penny-trained-v9
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -60,35 +60,13 @@ substitutions:
   # tensor arena fails to allocate ("Failed to allocate tensors"). To fall back to a stock
   # trigger, set `okay_nabu`.
   #
-  # 2026-09-29: VALIDATED v4 model (wake_words/penny_v4.{tflite,json}) — supersedes the v2
-  # synthetic-only placeholder this file shipped with earlier the same day. Real-voice
-  # session-disjoint holdout eval: recall flat at 0.88 with ZERO false accepts across the whole
-  # 0.51-0.61 cutoff band at window 5 (the earlier "GATE FAILED" note on out/penny_v4.json was
-  # from a window=3 run with mis-cut clips — stale, not carried into the manifest vendored here).
-  # TO SWAP IN A FUTURE MODEL: point this substitution at the new manifest (or overwrite
-  # penny_v4.{tflite,json} in place), then update wake_penny_cutoff_idle/_idle_int/_session_int
-  # and wake_penny_window below to that model's own validated values. That is the full extent of
-  # the swap, plus a rebuild.
-  wake_word_model: wake_words/penny_v4.json
-  # Penny cutoff/window — single source of truth so the swap above is a one-line-per-value change.
-  # 2026-09-29 v4.2 RETUNE: office false-woke twice in 6 min at idle 0.61 (window 5) — one false
-  # accept transcribed as ordinary room speech. The real-voice holdout eval
-  # (~/neo-wakeword/eval_real_v4_recut_holdout.log, window 5) shows recall flat at 0.84 from
-  # cutoff 0.63 up to 0.85 (0.88 at 0.51-0.61, 0.80 at 0.87-0.89, 0.76 at 0.91) — raising idle to
-  # 0.85 costs ~1 clip of recall and should cut the false-wake rate. Session/barge-in moves to
-  # 0.61 (was 0.56) — still inside the flat-recall band, mic is already open so a slightly
-  # stricter bar there is cheap. int(probability * 255): 0.85 -> 217, 0.61 -> 155.
-  # NOTE: ESPHome quantizes this float form via int(x*255) — TRUNCATION, not rounding
-  # (micro_wake_word/__init__.py). 0.85*255=216.75 truncates to 216, one shy of the target 217
-  # that drives the actual idle_int below — use 0.851 (217.005 -> 217) so the model's initial
-  # construction-time cutoff (before any script.execute ever runs) already matches idle_int.
-  wake_penny_cutoff_idle: "0.851"         # float form, for the models: list entry below
-  wake_penny_cutoff_idle_int: "217"       # 0.85 quantized — idle tier for the lambdas
-  wake_penny_cutoff_session_int: "155"    # 0.61 quantized — session/barge-in tier
-  # Sliding window: 5 (NOT 8 — a window of 8 made the PE deaf; see memory
-  # wake-sliding-window-sizing.md, "known-good floor: 5", also what the kitchen Sat1 runs).
-  # Overridden inline in the models: entry below so it applies regardless of what the manifest
-  # JSON says (belt-and-suspenders — the manifest also carries 5).
+  # Latest reviewed Penny crops + mined training negatives, matching kitchen v7.
+  # Strict rejection remains active during playback and barge-in as well as idle.
+  # Calibrated on saved clips; everyday PE recall/false-wake behavior needs observation.
+  wake_word_model: wake_words/penny_v5_oct1.json
+  wake_penny_cutoff_idle: "0.922"
+  wake_penny_cutoff_idle_int: "235"
+  wake_penny_cutoff_session_int: "235"
   wake_penny_window: "5"
 
 esphome:
@@ -1233,7 +1211,7 @@ micro_wake_word:
     # single-source-of-truth cutoff/window values and the v4-model swap-in instructions.
     - model: ${wake_word_model}
       id: primary_wake_word
-      probability_cutoff: ${wake_penny_cutoff_idle}   # validated v4 real-voice eval (0.51-0.61 band)
+      probability_cutoff: ${wake_penny_cutoff_idle}   # reviewed candidate calibrated at 235/255
       sliding_window_size: ${wake_penny_window}
     # Extra triggers disabled for this build — uncomment to also wake on these:
     # - model: hey_jarvis
@@ -1362,16 +1340,9 @@ voice_assistant_websocket:
         id: media_mixing_input
         decibel_reduction: 20  # Lower media volume by 20dB when voice assistant is active
         duration: 0.0s
-    # Barge-in sensitivity, scoped to the session. The static probability_cutoff is a single knob
-    # forced to serve two opposite jobs: strict enough that idle ambience doesn't false-wake, loose
-    # enough to catch the wake word through the AEC residual of its own playback. Splitting it by
-    # state removes the conflict: stay strict (idle) while idle, drop to the looser session tier
-    # only for the duration of a session — which is the only time barge-in can happen anyway, and
-    # when the mic is already open and streaming.
-    # micro_wake_word exposes no YAML action for this, but WakeWordModel::set_probability_cutoff
-    # is public and the cutoff is quantised as int(probability * 255) — see the substitutions block
-    # (wake_penny_cutoff_idle_int / wake_penny_cutoff_session_int) for the single source of truth.
-    - lambda: id(primary_wake_word).set_probability_cutoff(${wake_penny_cutoff_session_int});   # session — barge-in over playback
+    # Keep the calibrated cutoff during barge-in; opening a session must not
+    # lower rejection of background conversation with this model.
+    - lambda: id(primary_wake_word).set_probability_cutoff(${wake_penny_cutoff_session_int});
   on_disconnected:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # turn ended → idle (ring off), NOT not_ready (red). Red is reserved for WiFi-down.
     - script.execute: control_leds
