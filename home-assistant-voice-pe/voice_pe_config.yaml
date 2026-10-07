@@ -29,7 +29,7 @@
 #    esphome upload voice_pe_config.yaml
 
 substitutions:
-  esp32_fw_version: neo-2026.10.04-penny-trigger-v10
+  esp32_fw_version: neo-2026.10.07-office-dropin-v1
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -1279,10 +1279,12 @@ external_components:
       path: esphome/components
     components: [voice_assistant_websocket, i2s_audio]
   # Shared Neo intercom transport plus its source-owned output reservation
-  # adapters. The PE profile replaces only Satellite1-specific hardware hooks.
+  # adapters. Run `python verify_shared_components.py` before every build; its
+  # content lock prevents this sibling checkout from drifting silently. The PE
+  # profile replaces only Satellite1-specific hardware hooks.
   - source:
       type: local
-      path: ../../neo-audit-fixes/satellite1-release-r21/esphome/components
+      path: ../../satellite1-neo/esphome/components
     components: [neo_intercom, satellite1, tas2780, fusb302b]
   # Voice PE Hardware Components
   - source:
@@ -1315,6 +1317,24 @@ neo_intercom:
   mixer: mixing_speaker
   media_player: voice_media_player
   chime_dma_profile_verified: true
+  on_feedback:
+    - lambda: |-
+        if (status == "connecting") id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+        else if (status == "connected") id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+        else if (status == "command_armed") id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
+        else if (status == "unavailable") id(voice_assistant_phase) = ${voice_assist_error_phase_id};
+        else id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+        id(control_leds).execute();
+    - if:
+        condition:
+          lambda: return status == "command_armed";
+        then:
+          - delay: 5s
+          - lambda: |-
+              if (id(pe_intercom).is_active()) {
+                id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+                id(control_leds).execute();
+              }
 
 # Voice Assistant WebSocket Component
 voice_assistant_websocket:

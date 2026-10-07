@@ -62,6 +62,7 @@ void VoiceAssistantWebSocket::loop() {
       if (!this->pending_dropin_request_id_.empty()) {
         if (static_cast<int32_t>(millis() - this->pending_dropin_deadline_ms_) >= 0) {
           ESP_LOGW(TAG, "Drop In source did not become ready before deadline");
+          neo_intercom::NeoIntercom::local_dropin_unavailable();
           this->pending_dropin_request_id_.clear();
           this->pending_dropin_room_.clear();
         } else if (neo_intercom::NeoIntercom::dropin_source_ready()) {
