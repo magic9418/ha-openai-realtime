@@ -760,9 +760,20 @@ void VoiceAssistantWebSocket::dispatch_deferred_() {
       case DeferredEvent::EV_ERROR:
         this->error_trigger_.trigger();
         break;
-      case DeferredEvent::EV_ENROLL_START:
+      case DeferredEvent::EV_ENROLL_START: {
         this->enroll_start_trigger_.trigger();
+        // Send confirmation after the main-loop automation disarms detection.
+        char ack[200];
+        const bool wake_tap = this->enroll_wake_tap_;
+        snprintf(ack, sizeof(ack),
+                 "{\"type\":\"enroll_capture\",\"capture\":\"%s\",\"channel\":%u,\"gain_factor\":%u,"
+                 "\"input_rate_hz\":16000,\"output_rate_hz\":24000}",
+                 wake_tap ? "wake_tap" : "command",
+                 wake_tap ? this->enrollment_wake_channel_ : 0,
+                 wake_tap ? this->enrollment_wake_gain_factor_ : 1);
+        this->send_text_frame_(ack, pdMS_TO_TICKS(50));
         break;
+      }
       case DeferredEvent::EV_ENROLL_STOP:
         this->enroll_stop_trigger_.trigger();
         break;
@@ -1115,9 +1126,12 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   const int32_t *stereo_32bit = reinterpret_cast<const int32_t *>(data.data());
   int16_t *mono_16bit = this->mono_buffer_.data();
   
+  const bool wake_tap = this->enrolling_ && this->enroll_wake_tap_;
+  const uint8_t channel = wake_tap ? this->enrollment_wake_channel_ : 0;
   for (size_t i = 0; i < stereo_32bit_samples; i++) {
-    int32_t left_sample = stereo_32bit[i * 2];
-    mono_16bit[i] = static_cast<int16_t>((left_sample >> 16));
+    const int32_t sample = stereo_32bit[i * 2 + channel];
+    mono_16bit[i] = wake_tap ? wake_capture_sample(sample, this->enrollment_wake_gain_factor_)
+                           : static_cast<int16_t>(sample >> 16);
   }
   
   // Resample from 16kHz to 24kHz (1.5x upsampling)
@@ -1334,12 +1348,13 @@ void VoiceAssistantWebSocket::send_button_cancel() {
   this->send_text_frame_("{\"type\":\"button_cancel\"}", pdMS_TO_TICKS(50));
 }
 
-void VoiceAssistantWebSocket::enter_enrollment_() {
+void VoiceAssistantWebSocket::enter_enrollment_(bool wake_tap) {
   if (this->enrolling_) {
     ESP_LOGD(TAG, "Already enrolling");
     return;
   }
   ESP_LOGI(TAG, "Entering enrollment mode: mic pinned open, wake/stop models disarmed");
+  this->enroll_wake_tap_ = wake_tap;
   this->enrolling_ = true;
   this->enroll_start_time_ = millis();
   // Make sure the mic is actually running so reps stream to the backend. The YAML
@@ -1593,7 +1608,9 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
           // Enrollment mode enter/exit driven by the session-server EnrollmentConductor.
           if (message.find("\"mode\":\"start\"") != std::string::npos ||
               message.find("\"mode\": \"start\"") != std::string::npos) {
-            this->enter_enrollment_();
+            const bool wake_tap = message.find("\"capture\":\"wake_tap\"") != std::string::npos ||
+                                  message.find("\"capture\": \"wake_tap\"") != std::string::npos;
+            this->enter_enrollment_(wake_tap);
           } else if (message.find("\"mode\":\"stop\"") != std::string::npos ||
                      message.find("\"mode\": \"stop\"") != std::string::npos) {
             this->exit_enrollment_();
