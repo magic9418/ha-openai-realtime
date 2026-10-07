@@ -17,6 +17,7 @@
 #include <vector>
 #include <queue>
 #include <atomic>
+#include "wake_capture_sample.h"
 #include "wake_trigger_capture.h"
 
 // Barge-in policy toggle (see on_microphone_data_):
@@ -137,7 +138,7 @@ class VoiceAssistantWebSocket : public Component {
   void wake_trigger_init_();
   void wake_trigger_loop_();   // main loop: paced upload state machine
   void wake_trigger_abort_() { this->wt_state_.store(WT_NONE); }  // any task; just drops the job
-  void enter_enrollment_();                 // pin mic open, disarm wake+stop models
+  void enter_enrollment_(bool wake_tap);               // pin mic open, disarm wake+stop models
   void exit_enrollment_();                  // restore normal wake/stop-model operation
   void send_audio_chunk_(const uint8_t *data, size_t len);
   void process_received_audio_(const uint8_t *data, size_t len);
@@ -420,6 +421,7 @@ class VoiceAssistantWebSocket : public Component {
   uint8_t enrollment_wake_channel_{1};
   uint8_t enrollment_wake_gain_factor_{4};
   bool enrolling_{false};
+  std::atomic<bool> enroll_wake_tap_{false};
   uint32_t enroll_start_time_{0};
   static const uint32_t ENROLL_MAX_MS = 15 * 60 * 1000;  // 15-min hard safety cap
 };
