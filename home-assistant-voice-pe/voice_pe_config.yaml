@@ -32,7 +32,7 @@ substitutions:
   # Build recipe (ESPHome 2026.6.5 docker): mount this dir at /config and the sibling checkout
   # /home/matt/projects/satellite1-neo (shared_components.lock.json, verify_shared_components.py)
   # at /satellite1-neo so '../../satellite1-neo' resolves; run verify_shared_components.py first.
-  esp32_fw_version: neo-2026.10.08-office-dropin-trainprep-v12
+  esp32_fw_version: neo-2026.10.08-office-dropin-endfix-v13
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'

@@ -1,10 +1,10 @@
 {
   "consumer_base_commit": "cdfc241",
-  "source_base_commit": "8081781",
+  "source_base_commit": "959d4c1+endfix",
   "source_path": "../../satellite1-neo/esphome/components",
   "components": {
     "fusb302b": "23056b5578a2c9a9947cc1ea5352a1c6f3b513dce38d85c306d9483da7bfc5ac",
-    "neo_intercom": "a0718a8fea4461827677d2cfcda4381bf7a1fdb7508cb182478c67a68c1756e9",
+    "neo_intercom": "c70e44aae9a94e804ee9138c4a5799279e8058b1ec524a75b0646b4032a58918",
     "satellite1": "8aed926c125a5a353e5280ef5c9dfbca262968e502ca85c8aebd5dea91909fb6",
     "tas2780": "d1d26c748a79c73be84aaa392ba1dca6daf2abdb0359884c9421b8be16316196"
   }
