@@ -1,7 +1,7 @@
 {
   "consumer_base_commit": "cdfc241",
   "source_base_commit": "959d4c1+endfix",
-  "source_path": "../../satellite1-neo/esphome/components",
+  "source_path": "../../satellite1/esphome/components",
   "components": {
     "fusb302b": "23056b5578a2c9a9947cc1ea5352a1c6f3b513dce38d85c306d9483da7bfc5ac",
     "neo_intercom": "c70e44aae9a94e804ee9138c4a5799279e8058b1ec524a75b0646b4032a58918",
