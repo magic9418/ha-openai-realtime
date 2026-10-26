@@ -1241,7 +1241,7 @@ void VoiceAssistantWebSocket::capture_wake_trigger(bool bargein, uint8_t cutoff,
   this->wt_seq_ = 0;
   this->wt_marker_ = false;
   this->wt_state_.store(WT_WAIT_POST);
-  if (!bargein) {
+  if (!bargein && this->hold_duck_) {
     // HELD DUCK: the YAML no longer ducks at wake. The duck waits for the server's wake_verdict
     // (accepted -> duck; rejected/session end -> never) and fails open after wake_verdict_timeout_ms_.
     this->verdict_rx_.store(0);

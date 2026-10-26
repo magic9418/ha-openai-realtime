@@ -66,6 +66,8 @@ class VoiceAssistantWebSocket : public Component {
   void set_wake_verdict_timeout_ms(uint32_t ms) { this->wake_verdict_timeout_ms_ = ms; }
   // True from a captured cold wake until the duck decision (verdict / timeout / session end). YAML
   // `on_connected` uses it to NOT re-assert the duck while the verdict is still outstanding.
+  void set_hold_duck(bool v) { this->hold_duck_ = v; }
+  bool hold_duck_enabled() const { return this->hold_duck_; }
   bool duck_held() const { return this->duck_hold_.load(); }
   Trigger<> *get_wake_accepted_trigger() { return &this->wake_accepted_trigger_; }
   void set_server_url(const std::string &url) { this->server_url_ = url; }
@@ -442,6 +444,7 @@ class VoiceAssistantWebSocket : public Component {
   std::atomic<uint8_t> verdict_rx_{0};
   uint32_t duck_hold_start_ms_{0};
   uint32_t wake_verdict_timeout_ms_{3000};
+  bool hold_duck_{false};  // false: never arm the hold (duck behaviour identical to pre-hold firmware)
   Trigger<> wake_accepted_trigger_{};
   uint8_t enrollment_wake_channel_{1};
   uint8_t enrollment_wake_gain_factor_{4};

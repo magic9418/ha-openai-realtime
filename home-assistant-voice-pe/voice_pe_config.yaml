@@ -33,7 +33,7 @@ substitutions:
   # /home/matt/projects/penny/firmware/satellite1 (shared_components.lock.json, verify_shared_components.py)
   # at /satellite1 so '../../satellite1' resolves (natively it is firmware/voice-pe/home-assistant-voice-pe/../../satellite1);
   # run verify_shared_components.py first. The sibling must be content-identical to the lock (959d4c1 components).
-  esp32_fw_version: neo-2026.10.26-office-heldduck-v1
+  esp32_fw_version: neo-2026.10.26-office-capture-v2
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -76,6 +76,8 @@ substitutions:
   # server's {"type":"wake_verdict","accepted":true} and is skipped for a rejected wake; with no verdict
   # inside this many ms it ducks anyway (fail-open, same as the server's gate).
   wake_verdict_timeout_ms: "3000"
+  # MASTER SWITCH for the held duck. "false" (DEFAULT, v2): ducking exactly as v12 (in on_connected); capture/score still run.
+  hold_duck_until_verdict: "false"
 
 esphome:
   name: ha-voice-openai
@@ -1375,6 +1377,7 @@ voice_assistant_websocket:
   speaker: voice_resampling_speaker
   
   wake_verdict_timeout: ${wake_verdict_timeout_ms}ms
+  hold_duck: ${hold_duck_until_verdict}
 
   # HELD DUCK fires: the server accepted the cold wake (or said nothing for wake_verdict_timeout).
   on_wake_accepted:

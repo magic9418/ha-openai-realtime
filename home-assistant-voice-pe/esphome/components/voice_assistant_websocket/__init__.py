@@ -38,6 +38,7 @@ CONF_AUTO_STOP_INACTIVITY_MS = "auto_stop_inactivity_ms"
 # with no verdict at all (fail-open, matching the server). A rejected wake / session end never fires it.
 CONF_WAKE_VERDICT_TIMEOUT = "wake_verdict_timeout"
 CONF_ON_WAKE_ACCEPTED = "on_wake_accepted"
+CONF_HOLD_DUCK = "hold_duck"   # default False: capture only, duck exactly as before the hold existed
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -57,6 +58,7 @@ CONFIG_SCHEMA = cv.Schema(
             CONF_AUTO_STOP_INACTIVITY_MS, default="120s"
         ): cv.positive_time_period_milliseconds,
         cv.Optional(CONF_WAKE_VERDICT_TIMEOUT, default="3000ms"): cv.positive_time_period_milliseconds,
+        cv.Optional(CONF_HOLD_DUCK, default=False): cv.boolean,
         cv.Optional(CONF_ON_WAKE_ACCEPTED): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_CONNECTED): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_DISCONNECTED): automation.validate_automation(single=True),
@@ -95,6 +97,7 @@ async def to_code(config):
             config[CONF_WAKE_TRIGGER_WINDOW],
         )
     )
+    cg.add(var.set_hold_duck(config[CONF_HOLD_DUCK]))
     cg.add(var.set_wake_verdict_timeout_ms(config[CONF_WAKE_VERDICT_TIMEOUT].total_milliseconds))
     cg.add(
         var.set_auto_stop_inactivity_ms(
