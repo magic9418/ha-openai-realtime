@@ -30,9 +30,10 @@
 
 substitutions:
   # Build recipe (ESPHome 2026.6.5 docker): mount this dir at /config and the sibling checkout
-  # /home/matt/projects/satellite1-neo (shared_components.lock.json, verify_shared_components.py)
-  # at /satellite1-neo so '../../satellite1-neo' resolves; run verify_shared_components.py first.
-  esp32_fw_version: neo-2026.10.08-office-dropin-trainprep-v12
+  # /home/matt/projects/penny/firmware/satellite1 (shared_components.lock.json, verify_shared_components.py)
+  # at /satellite1 so '../../satellite1' resolves (natively it is firmware/voice-pe/home-assistant-voice-pe/../../satellite1);
+  # run verify_shared_components.py first. The sibling must be content-identical to the lock (959d4c1 components).
+  esp32_fw_version: neo-2026.10.26-office-heldduck-v1
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -71,6 +72,10 @@ substitutions:
   wake_penny_cutoff_idle_int: "235"
   wake_penny_cutoff_session_int: "235"
   wake_penny_window: "5"
+  # HELD DUCK: a cold wake no longer ducks the music when the session opens. The duck waits for the
+  # server's {"type":"wake_verdict","accepted":true} and is skipped for a rejected wake; with no verdict
+  # inside this many ms it ducks anyway (fail-open, same as the server's gate).
+  wake_verdict_timeout_ms: "3000"
 
 esphome:
   name: ha-voice-openai
@@ -1247,7 +1252,7 @@ micro_wake_word:
               then:
                 # Wake-trigger capture (barge-in): freeze the detector's last 2 s NOW; uploaded after
                 # the `interrupt` frame. In-session cutoff = ${wake_penny_cutoff_session_int}.
-                - lambda: id(voice_assistant_ws).capture_wake_trigger(true, ${wake_penny_cutoff_session_int}, "session");
+                - lambda: id(voice_assistant_ws).capture_wake_trigger(true, ${wake_penny_cutoff_session_int}, "session", id(mww).get_last_detection_average(), id(mww).get_last_detection_max());
                 - voice_assistant_websocket.interrupt:
                     id: voice_assistant_ws
           # Cold wake: START the session BEFORE the chime, so the WS connect runs *underneath* the
@@ -1264,7 +1269,8 @@ micro_wake_word:
               then:
                 # Wake-trigger capture (cold wake): freeze the detector's last 2 s NOW (before start);
                 # uploaded after the session's `wake` frame. Idle cutoff = ${wake_penny_cutoff_idle_int}.
-                - lambda: id(voice_assistant_ws).capture_wake_trigger(false, ${wake_penny_cutoff_idle_int}, "idle");
+                # (also arms the HELD DUCK: this PE ducks media in on_wake_accepted below, not at on_connected)
+                - lambda: id(voice_assistant_ws).capture_wake_trigger(false, ${wake_penny_cutoff_idle_int}, "idle", id(mww).get_last_detection_average(), id(mww).get_last_detection_max());
                 - voice_assistant_websocket.start:
                     id: voice_assistant_ws
           # NEO: wake silently — no wake chime (parity with the Sat1; Matt doesn't want Neo to chime on
@@ -1280,14 +1286,14 @@ external_components:
   - source:
       type: local
       path: esphome/components
-    components: [voice_assistant_websocket, i2s_audio]
+    components: [voice_assistant_websocket, i2s_audio, micro_wake_word]   # micro_wake_word: held-duck score patch (esphome/components/micro_wake_word/NEO_PATCH.md)
   # Shared Neo intercom transport plus its source-owned output reservation
   # adapters. Run `python verify_shared_components.py` before every build; its
   # content lock prevents this sibling checkout from drifting silently. The PE
   # profile replaces only Satellite1-specific hardware hooks.
   - source:
       type: local
-      path: ../../satellite1-neo/esphome/components
+      path: ../../satellite1/esphome/components
     components: [neo_intercom, satellite1, tas2780, fusb302b]
   # Voice PE Hardware Components
   - source:
@@ -1368,16 +1374,30 @@ voice_assistant_websocket:
   # We resample 24kHz -> 48kHz in code, then send to resampler which passes through
   speaker: voice_resampling_speaker
   
+  wake_verdict_timeout: ${wake_verdict_timeout_ms}ms
+
+  # HELD DUCK fires: the server accepted the cold wake (or said nothing for wake_verdict_timeout).
+  on_wake_accepted:
+    - mixer_speaker.apply_ducking:
+        id: media_mixing_input
+        decibel_reduction: 20
+        duration: 0.0s
   # State callbacks for LED control
   on_connected:
     - lambda: id(init_in_progress) = false;
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # Set to idle to show blue pulse (only if running)
     - script.execute: control_leds
-    # Apply ducking to media when voice assistant starts
-    - mixer_speaker.apply_ducking:
-        id: media_mixing_input
-        decibel_reduction: 20  # Lower media volume by 20dB when voice assistant is active
-        duration: 0.0s
+    # Apply ducking to media when voice assistant starts. HELD DUCK: skipped while a cold wake still
+    # waits for the server verdict (duck_held()); on_wake_accepted ducks then. Sessions not started by
+    # the wake word duck here as before.
+    - if:
+        condition:
+          lambda: return !id(voice_assistant_ws).duck_held();
+        then:
+          - mixer_speaker.apply_ducking:
+              id: media_mixing_input
+              decibel_reduction: 20  # Lower media volume by 20dB when voice assistant is active
+              duration: 0.0s
     # Keep the calibrated cutoff during barge-in; opening a session must not
     # lower rejection of background conversation with this model.
     - lambda: id(primary_wake_word).set_probability_cutoff(${wake_penny_cutoff_session_int});

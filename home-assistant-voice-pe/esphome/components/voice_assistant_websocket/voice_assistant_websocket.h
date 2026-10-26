@@ -61,6 +61,13 @@ class VoiceAssistantWebSocket : public Component {
     this->wt_fw_ = fw;
     this->wt_window_ = window;
   }
+  // Held duck (see capture_wake_trigger / wake_verdict_loop_): how long a cold wake waits for the
+  // server's {"type":"wake_verdict"} before ducking anyway (fail-open, matching the server's).
+  void set_wake_verdict_timeout_ms(uint32_t ms) { this->wake_verdict_timeout_ms_ = ms; }
+  // True from a captured cold wake until the duck decision (verdict / timeout / session end). YAML
+  // `on_connected` uses it to NOT re-assert the duck while the verdict is still outstanding.
+  bool duck_held() const { return this->duck_hold_.load(); }
+  Trigger<> *get_wake_accepted_trigger() { return &this->wake_accepted_trigger_; }
   void set_server_url(const std::string &url) { this->server_url_ = url; }
   void set_microphone(microphone::Microphone *mic) { this->microphone_ = mic; }
   void set_speaker(speaker::Speaker *spkr) { this->speaker_ = spkr; }
@@ -79,7 +86,12 @@ class VoiceAssistantWebSocket : public Component {
   // audio and queues it for upload after the session's `wake` / `interrupt` frame. `cutoff` and
   // `regime` are what the YAML knows was active at detection. No-op if the feature is disabled
   // (PSRAM alloc failed), enrolling, or a previous upload is still in flight.
-  void capture_wake_trigger(bool bargein, uint8_t cutoff, const char *regime);
+  // `score_avg` / `score_max` (0-255, cutoff scale) are micro_wake_word's sliding-window mean and peak
+  // at detection; pass -1 when the detector cannot report them. A COLD capture also arms the duck
+  // hold: the music is NOT ducked by the YAML at wake, only when the server answers (or times out).
+  // The upload starts WT_POST_MS after detection so the clip also holds the audio that followed it.
+  void capture_wake_trigger(bool bargein, uint8_t cutoff, const char *regime, int score_avg = -1,
+                            int score_max = -1);
 
   // Wake-boundary / flywheel control messages (see docs/firmware_guards_plan.md &
   // docs/wakeword_flywheel_plan.md). Each sends a JSON text frame to the server;
@@ -138,6 +150,8 @@ class VoiceAssistantWebSocket : public Component {
   void wake_trigger_init_();
   void wake_trigger_loop_();   // main loop: paced upload state machine
   void wake_trigger_abort_() { this->wt_state_.store(WT_NONE); }  // any task; just drops the job
+  void wake_verdict_loop_();   // main loop: fire the held duck on verdict / fail-open timeout
+  void duck_hold_cancel_() { this->duck_hold_.store(false); this->verdict_rx_.store(0); }  // any task
   void enter_enrollment_(bool wake_tap);               // pin mic open, disarm wake+stop models
   void exit_enrollment_();                  // restore normal wake/stop-model operation
   void send_audio_chunk_(const uint8_t *data, size_t len);
@@ -400,7 +414,8 @@ class VoiceAssistantWebSocket : public Component {
   // Auto-restores on {"enroll","stop"}, WS drop, or the 15-min safety cap.
   // Wake-trigger capture state. Ring/snapshot/scratch are ONE PSRAM block (WT_ALLOC_BYTES), allocated
   // once in setup(); wt_enabled_ stays false (feature off, never internal RAM) if that fails.
-  enum : uint8_t { WT_NONE = 0, WT_WAIT_MARKER = 1, WT_SENDING = 2 };
+  enum : uint8_t { WT_NONE = 0, WT_WAIT_MARKER = 1, WT_SENDING = 2, WT_WAIT_POST = 3 };
+  static const uint32_t WT_POST_WAIT_TIMEOUT_MS = 2000;  // mic stalled: never reached detection + WT_POST_MS
   static const uint32_t WT_MARKER_TIMEOUT_MS = 8000;  // give up if the wake/interrupt frame never goes out
   static const uint32_t WT_COLD_SETTLE_MS = 250;      // after `hello`: let the look-back burst start first
   static const uint32_t WT_PACE_MS = 20;              // min gap between upload frames
@@ -418,6 +433,16 @@ class VoiceAssistantWebSocket : public Component {
   std::string wt_model_{"unknown"};
   std::string wt_fw_{"unknown"};
   uint8_t wt_window_{0};
+  uint32_t wt_end_total_{0};        // ring counter value the snapshot must end at (detection + WT_POST_MS)
+  int16_t wt_score_avg_{-1};        // detector sliding-window mean at detection, 0-255; -1 = unknown
+  int16_t wt_score_max_{-1};        // detector peak single-inference probability, 0-255; -1 = unknown
+  // Held duck. duck_hold_: a cold wake was captured and the server has not answered yet. verdict_rx_
+  // (written by the websocket task): 0 none, 1 accepted, 2 rejected; consumed by the main loop.
+  std::atomic<bool> duck_hold_{false};
+  std::atomic<uint8_t> verdict_rx_{0};
+  uint32_t duck_hold_start_ms_{0};
+  uint32_t wake_verdict_timeout_ms_{3000};
+  Trigger<> wake_accepted_trigger_{};
   uint8_t enrollment_wake_channel_{1};
   uint8_t enrollment_wake_gain_factor_{4};
   bool enrolling_{false};

@@ -33,6 +33,11 @@ CONF_ON_STOPPED = "on_stopped"
 CONF_ON_ENROLL_START = "on_enroll_start"
 CONF_ON_ENROLL_STOP = "on_enroll_stop"
 CONF_AUTO_STOP_INACTIVITY_MS = "auto_stop_inactivity_ms"
+# Held duck: a cold wake does not duck the music until the server's wake_verdict arrives. The YAML
+# `on_wake_accepted` automation does the duck; it fires on {accepted:true}, or after this timeout
+# with no verdict at all (fail-open, matching the server). A rejected wake / session end never fires it.
+CONF_WAKE_VERDICT_TIMEOUT = "wake_verdict_timeout"
+CONF_ON_WAKE_ACCEPTED = "on_wake_accepted"
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -51,6 +56,8 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(
             CONF_AUTO_STOP_INACTIVITY_MS, default="120s"
         ): cv.positive_time_period_milliseconds,
+        cv.Optional(CONF_WAKE_VERDICT_TIMEOUT, default="3000ms"): cv.positive_time_period_milliseconds,
+        cv.Optional(CONF_ON_WAKE_ACCEPTED): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_CONNECTED): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_DISCONNECTED): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_ERROR): automation.validate_automation(single=True),
@@ -88,6 +95,7 @@ async def to_code(config):
             config[CONF_WAKE_TRIGGER_WINDOW],
         )
     )
+    cg.add(var.set_wake_verdict_timeout_ms(config[CONF_WAKE_VERDICT_TIMEOUT].total_milliseconds))
     cg.add(
         var.set_auto_stop_inactivity_ms(
             config[CONF_AUTO_STOP_INACTIVITY_MS].total_milliseconds
@@ -103,6 +111,11 @@ async def to_code(config):
         cg.add(var.set_speaker(spkr))
     
     # Register automation triggers
+    if CONF_ON_WAKE_ACCEPTED in config:
+        await automation.build_automation(
+            var.get_wake_accepted_trigger(), [], config[CONF_ON_WAKE_ACCEPTED]
+        )
+
     if CONF_ON_CONNECTED in config:
         await automation.build_automation(
             var.get_connected_trigger(), [], config[CONF_ON_CONNECTED]

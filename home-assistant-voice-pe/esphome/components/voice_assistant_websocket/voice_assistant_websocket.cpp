@@ -52,6 +52,7 @@ void VoiceAssistantWebSocket::loop() {
   this->dispatch_deferred_();
   // Paced wake-trigger upload (<=1 frame per iteration). Main task only - never the mic task.
   this->wake_trigger_loop_();
+  this->wake_verdict_loop_();
 
 #ifdef USE_NEO_INTERCOM
   // Dial only on the authenticated intercom connection, after assistant teardown.
@@ -337,6 +338,7 @@ void VoiceAssistantWebSocket::stop() {
   
   ESP_LOGI(TAG, "Stopping Voice Assistant WebSocket...");
   this->wake_trigger_abort_();  // session ending: drop any queued/in-flight trigger upload
+  this->duck_hold_cancel_();    // session ending: no held duck any more (nothing left to duck for)
   this->audio_transport_ready_ = false;
   this->state_ = VOICE_ASSISTANT_WEBSOCKET_STOPPING;
   
@@ -1186,10 +1188,13 @@ bool VoiceAssistantWebSocket::is_bot_speaking() const {
 }
 
 // ---- Wake-trigger capture ------------------------------------------------------------------
-// Uploads the ~2 s of DETECTOR-channel audio that fired the wake word, so false wakes can be studied
-// (and retrained on) from the audio the model actually scored. Flow:
-//   YAML on_wake_word_detected -> capture_wake_trigger(): snapshot the ring (main loop, ~1 memcpy of
-//   64 KB, mic task never blocked) and queue the job -> the session's `wake` (cold, sent from the WS
+// Uploads the 2.5 s of DETECTOR-channel audio around the wake word (2.0 s before the detection
+// instant + WT_POST_MS after it), so false wakes can be studied (and retrained on) from the audio the
+// model actually scored. Flow:
+//   YAML on_wake_word_detected -> capture_wake_trigger(): remember the ring counter at the detection
+//   instant and queue the job (WT_WAIT_POST) -> wake_trigger_loop_() snapshots the window ending
+//   WT_POST_MS later (main loop, ~1 memcpy of 80 KB, mic task never blocked) -> the session's `wake`
+//   (cold, sent from the WS
 //   task at CONNECTED) / `interrupt` (barge-in, sent from interrupt()) frame goes out and sets
 //   wt_marker_ -> wake_trigger_loop_() sends start + 16 chunks + end, <=1 frame per loop iteration,
 //   >=WT_PACE_MS apart, so the live mic uplink is never starved. Any session end/disconnect drops it.
@@ -1210,29 +1215,61 @@ void VoiceAssistantWebSocket::wake_trigger_init_() {
 #endif
 }
 
-void VoiceAssistantWebSocket::capture_wake_trigger(bool bargein, uint8_t cutoff, const char *regime) {
+void VoiceAssistantWebSocket::capture_wake_trigger(bool bargein, uint8_t cutoff, const char *regime, int score_avg,
+                                                   int score_max) {
   if (!this->wt_enabled_ || this->enrolling_) return;
   if (this->wt_state_.load() != WT_NONE) {
     ESP_LOGW(TAG, "Wake trigger: previous upload still in flight, skipping this capture");
     return;
   }
-  // The newest WT_BYTES ending at this instant: the main-loop wake callback runs within a loop tick
-  // of micro_wake_word's detection, and the ring is fed by the same mic stream the detector reads.
-  if (!this->wt_ring_.snapshot()) {
-    ESP_LOGW(TAG, "Wake trigger: ring not full yet (%u/%u B) or overrun; no capture",
-             (unsigned) this->wt_ring_.filled_bytes(), (unsigned) WT_BYTES);
+  // The detection instant is "now" on the ring's byte counter: the main-loop wake callback runs
+  // within a loop tick of micro_wake_word's detection, and the ring is fed by the same mic stream
+  // the detector reads. The snapshot is taken later, once WT_POST_MS more audio has arrived.
+  if (this->wt_ring_.filled_bytes() < WT_PRE_BYTES) {
+    ESP_LOGW(TAG, "Wake trigger: ring not full yet (%u/%u B); no capture",
+             (unsigned) this->wt_ring_.filled_bytes(), (unsigned) WT_PRE_BYTES);
     return;
   }
+  this->wt_end_total_ = wt_total_add(this->wt_ring_.total_bytes(), (uint32_t) WT_POST_BYTES);
   this->wt_bargein_ = bargein;
   this->wt_cutoff_ = cutoff;
+  this->wt_score_avg_ = (score_avg >= 0 && score_avg <= 255) ? (int16_t) score_avg : (int16_t) -1;
+  this->wt_score_max_ = (score_max >= 0 && score_max <= 255) ? (int16_t) score_max : (int16_t) -1;
   snprintf(this->wt_regime_, sizeof(this->wt_regime_), "%s", regime != nullptr ? regime : "fixed");
   this->wt_captured_ms_ = millis();
   this->wt_ready_ms_ = 0;
   this->wt_seq_ = 0;
   this->wt_marker_ = false;
-  this->wt_state_.store(WT_WAIT_MARKER);
-  ESP_LOGI(TAG, "Wake trigger captured (%s, cutoff %u, regime %s)", bargein ? "bargein" : "cold",
-           (unsigned) cutoff, this->wt_regime_);
+  this->wt_state_.store(WT_WAIT_POST);
+  if (!bargein) {
+    // HELD DUCK: the YAML no longer ducks at wake. The duck waits for the server's wake_verdict
+    // (accepted -> duck; rejected/session end -> never) and fails open after wake_verdict_timeout_ms_.
+    this->verdict_rx_.store(0);
+    this->duck_hold_start_ms_ = this->wt_captured_ms_;
+    this->duck_hold_.store(true);
+  }
+  ESP_LOGI(TAG, "Wake trigger armed (%s, cutoff %u, regime %s, score %d/%d, +%u ms post)",
+           bargein ? "bargein" : "cold", (unsigned) cutoff, this->wt_regime_, (int) this->wt_score_avg_,
+           (int) this->wt_score_max_, (unsigned) WT_POST_MS);
+}
+
+// Main loop. Resolves the held duck: accepted verdict or the fail-open timeout fires the YAML
+// `on_wake_accepted` automation (the duck); a rejected verdict just releases the hold.
+void VoiceAssistantWebSocket::wake_verdict_loop_() {
+  if (!this->duck_hold_.load()) return;
+  const uint8_t v = this->verdict_rx_.exchange(0);
+  if (v == 2) {
+    this->duck_hold_.store(false);
+    ESP_LOGI(TAG, "Held duck released: server rejected the wake - music NOT ducked");
+    return;
+  }
+  const bool timed_out = (int32_t)(millis() - this->duck_hold_start_ms_ - this->wake_verdict_timeout_ms_) >= 0;
+  if (v == 1 || timed_out) {
+    this->duck_hold_.store(false);
+    if (v != 1) ESP_LOGW(TAG, "Held duck: no wake_verdict in %u ms - ducking anyway (fail-open)",
+                         (unsigned) this->wake_verdict_timeout_ms_);
+    this->wake_accepted_trigger_.trigger();
+  }
 }
 
 void VoiceAssistantWebSocket::wake_trigger_loop_() {
@@ -1251,6 +1288,25 @@ void VoiceAssistantWebSocket::wake_trigger_loop_() {
     return;
   }
   char *buf = this->wt_ring_.json_buf();
+  if (st == WT_WAIT_POST) {
+    // Wait until WT_POST_MS of audio has followed the detection instant, then freeze exactly the
+    // WT_BYTES that end there (2.0 s before + 0.5 s after).
+    if (!this->wt_ring_.reached(this->wt_end_total_)) {
+      if ((now - this->wt_captured_ms_) > WT_POST_WAIT_TIMEOUT_MS) {
+        ESP_LOGW(TAG, "Wake trigger: mic produced no post-trigger audio; dropping capture");
+        this->wt_state_.store(WT_NONE);
+      }
+      return;
+    }
+    if (!this->wt_ring_.snapshot_ending_at(this->wt_end_total_)) {
+      ESP_LOGW(TAG, "Wake trigger: ring overrun/late snapshot (%u B filled); no capture",
+               (unsigned) this->wt_ring_.filled_bytes());
+      this->wt_state_.store(WT_NONE);
+      return;
+    }
+    this->wt_state_.store(WT_WAIT_MARKER);
+    return;
+  }
   if (st == WT_WAIT_MARKER) {
     if ((now - this->wt_captured_ms_) > WT_MARKER_TIMEOUT_MS) {
       this->wt_state_.store(WT_NONE);
@@ -1267,15 +1323,30 @@ void VoiceAssistantWebSocket::wake_trigger_loop_() {
       if (since < WT_COLD_SETTLE_MS) return;
       if (this->uplink_fill_ > 2 * UPLINK_SEND_CHUNK && since < WT_COLD_SETTLE_MS + 1000) return;
     }
-    const int n = snprintf(
+    const int n0 = snprintf(
         buf, WT_JSON_BYTES,
         "{\"type\":\"wake_trigger_start\",\"kind\":\"%s\",\"sample_rate\":%u,\"samples\":%u,\"chunks\":%u,"
         "\"channel\":%u,\"gain_factor\":%u,\"cutoff\":%u,\"window\":%u,\"regime\":\"%s\",\"model\":\"%s\","
-        "\"fw\":\"%s\"}",
+        "\"fw\":\"%s\",\"post_trigger_ms\":%u,\"pre_trigger_ms\":%u",
         this->wt_bargein_ ? "bargein" : "cold", (unsigned) WT_SAMPLE_RATE, (unsigned) WT_SAMPLES,
         (unsigned) wt_chunk_count(WT_BYTES), (unsigned) this->enrollment_wake_channel_,
         (unsigned) this->enrollment_wake_gain_factor_, (unsigned) this->wt_cutoff_, (unsigned) this->wt_window_,
-        this->wt_regime_, this->wt_model_.c_str(), this->wt_fw_.c_str());
+        this->wt_regime_, this->wt_model_.c_str(), this->wt_fw_.c_str(), (unsigned) WT_POST_MS,
+        (unsigned) WT_PRE_MS);
+    int n = n0;
+    if (n0 > 0 && size_t(n0) < WT_JSON_BYTES && this->wt_score_avg_ >= 0) {
+      // detector_score = sliding-window MEAN probability at detection (0-255, the cutoff scale);
+      // detector_score_max = highest single inference in that window (0-255).
+      n = snprintf(buf + n0, WT_JSON_BYTES - n0, ",\"detector_score\":%d,\"detector_score_max\":%d",
+                   (int) this->wt_score_avg_, (int) this->wt_score_max_);
+      n = (n > 0) ? n0 + n : -1;
+    }
+    if (n > 0 && size_t(n) + 1 < WT_JSON_BYTES) {
+      buf[n++] = '}';
+      buf[n] = '\0';
+    } else {
+      n = -1;
+    }
     if (n <= 0 || size_t(n) >= WT_JSON_BYTES ||
         esp_websocket_client_send_text(this->websocket_client_, buf, n, pdMS_TO_TICKS(50)) != n) {
       ESP_LOGW(TAG, "Wake trigger: start frame not sent; dropping upload");
@@ -1401,7 +1472,8 @@ void VoiceAssistantWebSocket::interrupt() {
   } else {
     ESP_LOGI(TAG, "Interrupt message sent successfully");
     // A barge-in trigger snapshot may now follow the interrupt frame (paced by the main loop).
-    if (this->wt_state_.load() == WT_WAIT_MARKER && this->wt_bargein_) this->wt_marker_ = true;
+    if ((this->wt_state_.load() == WT_WAIT_MARKER || this->wt_state_.load() == WT_WAIT_POST) && this->wt_bargein_)
+      this->wt_marker_ = true;
     // Stop speaker + drop the backlog atomically so buffered speech stops immediately on interrupt
     // (and the main-task drain can't re-feed stale bytes into the speaker after the stop).
     this->audio_ring_flush_and_stop_speaker_();
@@ -1463,7 +1535,8 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       // known limitation noted in docs/wakeword_flywheel_plan.md.)
       this->send_text_frame_("{\"type\":\"wake\"}");
       // A cold-wake trigger snapshot may now follow (main loop paces it; see wake_trigger_loop_).
-      if (this->wt_state_.load() == WT_WAIT_MARKER && !this->wt_bargein_ && this->is_connected())
+      if ((this->wt_state_.load() == WT_WAIT_MARKER || this->wt_state_.load() == WT_WAIT_POST) &&
+          !this->wt_bargein_ && this->is_connected())
         this->wt_marker_ = true;
 
       this->defer_event_(DeferredEvent::EV_STATE_CALLBACK, this->state_);
@@ -1476,6 +1549,7 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       
     case WEBSOCKET_EVENT_DISCONNECTED:
       this->wake_trigger_abort_();
+      this->duck_hold_cancel_();
       ESP_LOGW(TAG, "WebSocket disconnected");
       this->state_ = VOICE_ASSISTANT_WEBSOCKET_DISCONNECTED;
 
@@ -1505,7 +1579,13 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
         
         // Handle JSON control messages
         std::string message((const char *) event_data->data_ptr, event_data->data_len);
-        if (message.find("\"type\":\"interrupt\"") != std::string::npos ||
+        bool verdict_accepted = false;
+        if (message.find("wake_verdict") != std::string::npos && wt_parse_verdict(message, verdict_accepted)) {
+          // Server's answer on the cold-wake trigger clip. Consumed by the main loop (wake_verdict_loop_),
+          // which fires the held duck. Ignored when nothing is held (re-wake, barge-in, late frame).
+          ESP_LOGI(TAG, "wake_verdict: accepted=%d", (int) verdict_accepted);
+          if (this->duck_hold_.load()) this->verdict_rx_.store(verdict_accepted ? 1 : 2);
+        } else if (message.find("\"type\":\"interrupt\"") != std::string::npos ||
             message.find("\"type\": \"interrupt\"") != std::string::npos) {
           ESP_LOGI(TAG, "Interrupt received, stopping speaker");
           // Stop speaker + drop backlog atomically (matches the local barge-in path); the serialized
@@ -1625,6 +1705,7 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       
     case WEBSOCKET_EVENT_ERROR:
       this->audio_transport_ready_ = false;
+      this->duck_hold_cancel_();
       if (event_data != nullptr) {
         // Log error information - note: error_handle may not be fully populated for all error types
         int sock_errno = event_data->error_handle.esp_transport_sock_errno;
