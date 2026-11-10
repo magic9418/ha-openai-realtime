@@ -47,6 +47,10 @@ CONF_SLIDING_WINDOW_SIZE = "sliding_window_size"
 CONF_STOP_AFTER_DETECTION = "stop_after_detection"
 CONF_TENSOR_ARENA_SIZE = "tensor_arena_size"
 CONF_VAD = "vad"
+CONF_ON_WAKE_WORD_REJECTED = "on_wake_word_rejected"
+CONF_STAGE2 = "stage2"
+CONF_DEFAULT_MODE = "default_mode"
+CONF_DEFAULT_THRESHOLD = "default_threshold"
 
 TYPE_HTTP = "http"
 
@@ -339,6 +343,33 @@ def _maybe_empty_vad_schema(value):
     return VAD_MODEL_SCHEMA(value)
 
 
+def _validate_stage2_model_file(value):
+    """Path of the stage-2 .tflite, relative to the YAML like the stage-1 model manifest."""
+    value = cv.string(value)
+    path = Path(CORE.relative_config_path(value))
+    if not path.is_file():
+        raise cv.Invalid(f"stage2 model file not found: {path}")
+    if path.suffix != ".tflite":
+        raise cv.Invalid("stage2 model must be a .tflite file")
+    return value
+
+
+# NEO: on-device second-stage wake check (see NEO_PATCH.md). Runs once per stage-1 detection.
+STAGE2_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_MODEL): _validate_stage2_model_file,
+        cv.Optional(CONF_DEFAULT_MODE, default="shadow"): cv.one_of(
+            "off", "shadow", "enforce", lower=True
+        ),
+        cv.Optional(CONF_DEFAULT_THRESHOLD, default=0): cv.int_range(min=0, max=255),
+        cv.Optional(CONF_TENSOR_ARENA_SIZE, default=40000): cv.int_range(
+            min=16384, max=262144
+        ),
+        cv.GenerateID(CONF_RAW_DATA_ID): cv.declare_id(cg.uint8),
+    }
+)
+
+
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
@@ -357,6 +388,10 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_ON_WAKE_WORD_DETECTED): automation.validate_automation(
                 single=True
             ),
+            cv.Optional(CONF_ON_WAKE_WORD_REJECTED): automation.validate_automation(
+                single=True
+            ),
+            cv.Optional(CONF_STAGE2): STAGE2_SCHEMA,
             cv.Optional(CONF_VAD): _maybe_empty_vad_schema,
             cv.Optional(CONF_STOP_AFTER_DETECTION, default=True): cv.boolean,
             cv.Optional(CONF_TASK_STACK_IN_PSRAM): psram.validate_task_stack_in_psram,
@@ -528,6 +563,30 @@ async def to_code(config):
             var.get_wake_word_detected_trigger(),
             [(cg.std_string, "wake_word")],
             on_wake_word_detection_config,
+        )
+
+    if on_wake_word_rejected_config := config.get(CONF_ON_WAKE_WORD_REJECTED):
+        await automation.build_automation(
+            var.get_wake_word_rejected_trigger(),
+            [(cg.std_string, "wake_word")],
+            on_wake_word_rejected_config,
+        )
+
+    if stage2 := config.get(CONF_STAGE2):
+        model_path = Path(CORE.relative_config_path(stage2[CONF_MODEL]))
+        model_bytes = model_path.read_bytes()
+        rhs = [HexInt(x) for x in model_bytes]
+        stage2_arr = cg.progmem_array(stage2[CONF_RAW_DATA_ID], rhs)
+        mode = {"off": 0, "shadow": 1, "enforce": 2}[stage2[CONF_DEFAULT_MODE]]
+        cg.add(
+            var.configure_stage2(
+                stage2_arr,
+                len(model_bytes),
+                stage2[CONF_TENSOR_ARENA_SIZE],
+                mode,
+                stage2[CONF_DEFAULT_THRESHOLD],
+                model_path.stem,
+            )
         )
 
 

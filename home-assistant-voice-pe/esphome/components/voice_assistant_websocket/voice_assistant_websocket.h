@@ -19,6 +19,11 @@
 #include <atomic>
 #include "wake_capture_sample.h"
 #include "wake_trigger_capture.h"
+#include "wake_capture_v3.h"
+
+namespace esphome::micro_wake_word {
+class MicroWakeWord;
+}
 
 // Barge-in policy toggle (see on_microphone_data_):
 //   0 = DEFAULT half-duplex — mic muted while Neo speaks; barge-in is via the wake word ("Neo").
@@ -94,6 +99,18 @@ class VoiceAssistantWebSocket : public Component {
   // The upload starts WT_POST_MS after detection so the clip also holds the audio that followed it.
   void capture_wake_trigger(bool bargein, uint8_t cutoff, const char *regime, int score_avg = -1,
                             int score_max = -1);
+
+  // ---- NEO capture v3 / stage 2 (core/docs/wake_capture_v3_protocol.md) ---------------------------
+  // The detector whose stage-2 verdict + feature history ride along with each trigger upload (YAML
+  // `wake_detector: mww`). Optional: without it nothing in this block does anything.
+  void set_wake_detector(micro_wake_word::MicroWakeWord *d) { this->detector_ = d; }
+  // YAML `on_wake_word_rejected`: stage 2 dropped this detection (enforce mode). Uploads the clip over a
+  // QUIET capture-only connection: no LED, no duck, no chime, no mic uplink, state_ untouched. MAIN LOOP only.
+  void capture_rejected_wake(uint8_t cutoff, const char *regime, int score_avg = -1, int score_max = -1);
+  // True from the wake until the session is fully back to idle (any state but IDLE). A capture-only upload
+  // never changes it. Used by the YAML to tell micro_wake_word whether enforcement is allowed (cold idle).
+  bool session_active() const { return this->state_ != VOICE_ASSISTANT_WEBSOCKET_IDLE; }
+  bool capture_only_active() const { return this->co_state_.load() != CO_IDLE; }
 
   // Wake-boundary / flywheel control messages (see docs/firmware_guards_plan.md &
   // docs/wakeword_flywheel_plan.md). Each sends a JSON text frame to the server;
@@ -446,6 +463,60 @@ class VoiceAssistantWebSocket : public Component {
   uint32_t wake_verdict_timeout_ms_{3000};
   bool hold_duck_{false};  // false: never arm the hold (duck behaviour identical to pre-hold firmware)
   Trigger<> wake_accepted_trigger_{};
+  // ---- NEO capture v3 internals ----------------------------------------------------------------------
+  enum : uint8_t { CO_IDLE = 0, CO_CONNECTING, CO_WAIT_HELLO, CO_SENDING, CO_WAIT_ACK };
+  struct CoJob {
+    uint8_t phase{0};  // 0 free, 1 waiting for post-trigger audio, 2 snapshotted and ready to upload
+    uint32_t end_total{0};
+    uint32_t armed_ms{0};
+    uint8_t cutoff{0};
+    char regime[12]{};
+    int16_t score_avg{-1};
+    int16_t score_max{-1};
+    WakeS2Meta s2;
+    uint32_t fire_frame{0xFFFFFFFFu};
+    bool feat_ok{false};
+    micro_wake_word::FeatureWindow fw;
+  };
+  micro_wake_word::MicroWakeWord *detector_{nullptr};
+  void capture_v3_init_();
+  void capture_s2_meta_(WakeS2Meta &m, uint32_t &fire_frame);
+  void apply_wake_stage2_(uint8_t mode, uint8_t threshold);
+  void co_loop_();
+  void co_preempt_();
+  void co_start_connect_(int job);
+  void co_teardown_(bool graceful);
+  void co_free_job_(int i);
+  static void co_cleanup_task_(void *param);
+  static void co_event_handler_(void *args, esp_event_base_t base, int32_t event_id, void *data);
+  uint8_t *co_mem_{nullptr};          // PSRAM: 2 audio clips + 3 feature windows
+  uint8_t *co_audio_[2]{nullptr, nullptr};
+  int8_t *co_feat_[2]{nullptr, nullptr};
+  int8_t *wt_feat_{nullptr};          // feature window of the NORMAL (session) trigger upload
+  bool co_enabled_{false};
+  CoJob co_jobs_[2];
+  int co_active_{-1};
+  std::atomic<uint8_t> co_state_{CO_IDLE};
+  esp_websocket_client_handle_t co_client_{nullptr};  // its own handle: never websocket_client_
+  std::string co_url_;
+  std::atomic<uint8_t> co_hello_{0};  // 1 = hello with capture_only:true, 2 = plain hello (old server)
+  std::atomic<uint8_t> co_ack_{0};    // 1 = capture_ack ok, 2 = refused / not stored
+  std::atomic<bool> co_connected_{false};
+  std::atomic<bool> co_closed_{false};
+  std::atomic<bool> co_cleanup_active_{false};
+  esp_websocket_client_handle_t co_cleanup_client_{nullptr};
+  bool co_cleanup_graceful_{false};
+  bool co_old_server_{false};
+  bool co_ever_started_{false};
+  uint32_t co_start_ms_{0};
+  uint32_t co_last_start_ms_{0};
+  uint32_t co_next_ms_{0};
+  size_t co_seq_{0};
+  uint32_t co_n_started_{0}, co_n_acked_{0}, co_n_failed_{0}, co_n_dropped_{0}, co_n_preempted_{0};
+  WakeS2Meta wt_s2_;                  // stage-2 facts for the pending normal trigger upload
+  micro_wake_word::FeatureWindow wt_fwin_;
+  bool wt_feat_ok_{false};
+  uint32_t wt_fire_frame_{0xFFFFFFFFu};
   uint8_t enrollment_wake_channel_{1};
   uint8_t enrollment_wake_gain_factor_{4};
   bool enrolling_{false};

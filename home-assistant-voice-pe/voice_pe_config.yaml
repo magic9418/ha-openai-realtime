@@ -33,7 +33,7 @@ substitutions:
   # /home/matt/projects/penny/firmware/satellite1 (shared_components.lock.json, verify_shared_components.py)
   # at /satellite1 so '../../satellite1' resolves (natively it is firmware/voice-pe/home-assistant-voice-pe/../../satellite1);
   # run verify_shared_components.py first. The sibling must be content-identical to the lock (959d4c1 components).
-  esp32_fw_version: neo-2026.10.26-office-capture-v2
+  esp32_fw_version: neo-2026.11.10-office-stage2-v1
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -78,6 +78,12 @@ substitutions:
   wake_verdict_timeout_ms: "3000"
   # MASTER SWITCH for the held duck. "false" (DEFAULT, v2): ducking exactly as v12 (in on_connected); capture/score still run.
   hold_duck_until_verdict: "false"
+  # NEO stage 2 (on-device second-stage wake check, penny_stage2_v1). Mode/threshold below are only the COMPILED
+  # defaults; the server pushes the live values in `hello` (wake.stage2 in session-server config.yaml) and the
+  # last pushed value is persisted on the device. shadow = score + report, never reject. 0 threshold = default.
+  wake_stage2_model: "wake_words/penny_stage2_v1.tflite"
+  wake_stage2_mode: "shadow"
+  wake_stage2_threshold: "29"
 
 esphome:
   name: ha-voice-openai
@@ -1174,21 +1180,23 @@ media_player:
           decibel_reduction: 20  # Lower media volume by 20dB when voice assistant speaks
           duration: 0.0s
     on_state:
-      if:
-        condition:
-          and:
-            - not:
-                voice_assistant_websocket.is_running:
-                  id: voice_assistant_ws
-            # Must name the player explicitly now that sendspin_group_media_player is also a
-            # media_player — a bare id is ambiguous and fails config validation.
-            - not:
-                media_player.is_announcing: voice_media_player
-        then:
-          - mixer_speaker.apply_ducking:
-              id: media_mixing_input
-              decibel_reduction: 0  # Restore media volume
-              duration: 1.0s
+      # NEO stage 2 regime: music playing => shadow only.
+      - lambda: id(mww).set_stage2_cold_idle(!id(voice_assistant_ws).session_active() && id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING);
+      - if:
+          condition:
+            and:
+              - not:
+                  voice_assistant_websocket.is_running:
+                    id: voice_assistant_ws
+              # Must name the player explicitly now that sendspin_group_media_player is also a
+              # media_player — a bare id is ambiguous and fails config validation.
+              - not:
+                  media_player.is_announcing: voice_media_player
+          then:
+            - mixer_speaker.apply_ducking:
+                id: media_mixing_input
+                decibel_reduction: 0  # Restore media volume
+                duration: 1.0s
 
 # Wake Word Detection
 micro_wake_word:
@@ -1229,6 +1237,24 @@ micro_wake_word:
     # - model: hey_mycroft
     #   id: hey_mycroft
   vad:
+  # NEO stage 2: second-stage check of each stage-1 detection (see substitutions + NEO_PATCH.md).
+  stage2:
+    model: ${wake_stage2_model}
+    default_mode: ${wake_stage2_mode}
+    default_threshold: ${wake_stage2_threshold}
+    tensor_arena_size: 40000
+  # Stage 2 rejected this detection (enforce mode, cold idle only): no wake, no LED, no duck. The clip goes to
+  # the server over a quiet capture-only connection (own websocket; the session state stays IDLE).
+  on_wake_word_rejected:
+    - if:
+        condition:
+          and:
+            - switch.is_off: master_mute_switch
+            - not:
+                neo_intercom.is_active:
+                  id: pe_intercom
+        then:
+          - lambda: id(voice_assistant_ws).capture_rejected_wake(${wake_penny_cutoff_idle_int}, "idle", id(mww).get_last_detection_average(), id(mww).get_last_detection_max());
   on_wake_word_detected:
     - lambda: |-
         if (!id(master_mute_switch).state)
@@ -1378,6 +1404,7 @@ voice_assistant_websocket:
   
   wake_verdict_timeout: ${wake_verdict_timeout_ms}ms
   hold_duck: ${hold_duck_until_verdict}
+  wake_detector: mww   # stage-2 verdict + feature history ride with each trigger upload
 
   # HELD DUCK fires: the server accepted the cold wake (or said nothing for wake_verdict_timeout).
   on_wake_accepted:
@@ -1404,6 +1431,8 @@ voice_assistant_websocket:
     # Keep the calibrated cutoff during barge-in; opening a session must not
     # lower rejection of background conversation with this model.
     - lambda: id(primary_wake_word).set_probability_cutoff(${wake_penny_cutoff_session_int});
+    # NEO stage 2 regime: enforcement only for a cold idle wake (no session, no music).
+    - lambda: id(mww).set_stage2_cold_idle(!id(voice_assistant_ws).session_active() && id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING);
   on_disconnected:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # turn ended → idle (ring off), NOT not_ready (red). Red is reserved for WiFi-down.
     - script.execute: control_leds
@@ -1416,6 +1445,8 @@ voice_assistant_websocket:
         decibel_reduction: 0
         duration: 1.0s
     - lambda: id(primary_wake_word).set_probability_cutoff(${wake_penny_cutoff_idle_int});   # back to strict idle
+    # NEO stage 2 regime: enforcement only for a cold idle wake (no session, no music).
+    - lambda: id(mww).set_stage2_cold_idle(!id(voice_assistant_ws).session_active() && id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING);
   on_stopped:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # turn ended → idle (ring off), NOT not_ready (red). Red is reserved for WiFi-down.
     - script.execute: control_leds
@@ -1425,6 +1456,8 @@ voice_assistant_websocket:
         decibel_reduction: 0
         duration: 1.0s
     - lambda: id(primary_wake_word).set_probability_cutoff(${wake_penny_cutoff_idle_int});   # back to strict idle
+    # NEO stage 2 regime: enforcement only for a cold idle wake (no session, no music).
+    - lambda: id(mww).set_stage2_cold_idle(!id(voice_assistant_ws).session_active() && id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING);
   on_error:
     - if:
         condition:
@@ -1440,6 +1473,8 @@ voice_assistant_websocket:
     # Deliberately OUTSIDE the init guard above: a stranded loose cutoff means the device
     # false-wakes on ambience forever, so restore it on every error path without exception.
     - lambda: id(primary_wake_word).set_probability_cutoff(${wake_penny_cutoff_idle_int});   # back to strict idle
+    # NEO stage 2 regime: enforcement only for a cold idle wake (no session, no music).
+    - lambda: id(mww).set_stage2_cold_idle(!id(voice_assistant_ws).session_active() && id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING);
   # Wake-word enrollment mode (docs/wakeword_flywheel_plan.md Phase 3). The C++ owns the
   # mic-pin + 15-min safety cap + WS-drop restore; the YAML just disarms/re-arms the wake
   # model so guided reps ("Penny, Penny, Penny...") don't self-trigger while streaming.

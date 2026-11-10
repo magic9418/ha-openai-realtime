@@ -205,6 +205,7 @@ bool StreamingModel::perform_streaming_inference(const int8_t features[PREPROCES
     TfLiteTensor *input = this->interpreter_->input(0);
 
     uint8_t stride = this->interpreter_->input(0)->dims->data[1];
+    this->stride_ = stride;
     this->current_stride_step_ = this->current_stride_step_ % stride;
 
     std::memmove(

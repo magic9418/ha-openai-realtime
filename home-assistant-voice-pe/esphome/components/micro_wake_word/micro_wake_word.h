@@ -4,6 +4,8 @@
 
 #include "preprocessor_settings.h"
 #include "streaming_model.h"
+#include "wake_features.h"
+#include "wake_stage2.h"
 
 #include "esphome/components/microphone/microphone_source.h"
 #include "esphome/components/ring_buffer/ring_buffer.h"
@@ -70,6 +72,33 @@ class MicroWakeWord : public Component
   uint8_t get_last_detection_average() const { return this->last_detection_average_; }
   uint8_t get_last_detection_max() const { return this->last_detection_max_; }
 
+  // ---- NEO stage 2 (second-stage wake check) + feature history; see NEO_PATCH.md ----------------------
+  void configure_stage2(const uint8_t *model, size_t model_len, size_t arena_size, uint8_t default_mode,
+                        uint8_t default_threshold, const char *model_id) {
+    this->stage2_.configure(model, arena_size, default_mode, default_threshold, model_id);
+  }
+  /// Fires (main loop) for a stage-1 detection stage 2 rejected in enforce mode. The normal
+  /// on_wake_word_detected trigger is NOT raised for it; the detector re-arms exactly as after a detection.
+  Trigger<std::string> *get_wake_word_rejected_trigger() { return &this->wake_word_rejected_trigger_; }
+  // Thread-safe runtime control. threshold 0 = compiled default. Persisted across reboots (main loop).
+  void set_stage2_mode(uint8_t mode) { this->stage2_.set_mode(mode); }
+  void set_stage2_threshold(uint8_t threshold) { this->stage2_.set_threshold(threshold); }
+  // Regime: true only for a cold idle wake (no session, no reply, no music). Outside it stage 2 only shadows.
+  void set_stage2_cold_idle(bool cold_idle) { this->stage2_.set_cold_idle(cold_idle); }
+  uint8_t get_stage2_mode() const { return this->stage2_.mode(); }
+  uint8_t get_stage2_threshold() const { return this->stage2_.threshold(); }
+  const char *get_stage2_status() const { return this->stage2_.status(); }
+  const char *get_stage2_mode_name() const { return Stage2Runner::mode_name(this->stage2_.mode()); }
+  const std::string &get_stage2_model_id() const { return this->stage2_.model_id(); }
+  /// Stage-2 result of the detection being dispatched (valid inside on_wake_word_detected / _rejected).
+  const Stage2Result &get_last_stage2() const { return this->last_stage2_; }
+  /// Main loop. Copy the feature-upload window for the detection whose fire frame is `fire_frame`
+  /// (up to `want_post` frames after it) into dst (FEATURE_UPLOAD_MAX_FRAMES * 40 bytes).
+  bool copy_feature_upload(uint32_t fire_frame, size_t want_post, int8_t *dst, FeatureWindow *w) const {
+    const uint8_t stride = this->wake_word_models_.empty() ? uint8_t(0) : this->wake_word_models_[0]->get_stride();
+    return this->history_.copy_upload(fire_frame, stride == 0 ? uint8_t(3) : stride, want_post, dst, w);
+  }
+
   void add_wake_word_model(WakeWordModel *model);
 
 #ifdef USE_MICRO_WAKE_WORD_VAD
@@ -87,6 +116,10 @@ class MicroWakeWord : public Component
  protected:
   microphone::MicrophoneSource *microphone_source_{nullptr};
   Trigger<std::string> wake_word_detected_trigger_;
+  Trigger<std::string> wake_word_rejected_trigger_;
+  Stage2Runner stage2_;
+  FeatureHistory history_;  // PSRAM, 250 frames + probability rings
+  Stage2Result last_stage2_;
   uint8_t last_detection_average_{0};
   uint8_t last_detection_max_{0};
   State state_{State::STOPPED};
@@ -128,6 +161,9 @@ class MicroWakeWord : public Component
   void resume_task_();
 
   void set_state_(State state);
+
+  /// NEO: record one feature frame + the stage-1/VAD probabilities held as of it (inference task, no allocation).
+  void record_feature_frame_(const int8_t *features);
 
   /// @brief Generates a spectrogram feature from an input buffer of audio samples. The frontend buffers samples
   /// internally, so callers may stream arbitrary-sized chunks; a feature is only emitted once enough samples have

@@ -12,3 +12,11 @@ Used by `config/common/neo_voice.yaml` (`on_wake_word_detected`) -> `va_ws.captu
 -> `wake_trigger_start.detector_score` / `detector_score_max`. No behaviour change to detection:
 three assignments + two getters + two members. `average` is the sliding-window mean already computed
 by `WakeWordModel::determine_detected()` (integer sum / window, so 1/255 resolution).
+
+# Stage 2 + feature history (2026-11-10, branch feat/wake-stage2)
+
+Same additions as the Satellite1 copy (see its NEO_PATCH.md for the full description): feature history ring,
+second-stage runner (`wake_stage2.{h,cpp}`, `wake_features.h`, self-test headers), `on_wake_word_rejected`
+trigger, runtime mode/threshold/regime setters, inference task stack 3072 -> 4096. All new memory is PSRAM
+(10,500 B history + 40,000 B arena). Fail-open. The PE copy keeps its pre-existing differences from the Sat1
+copy (no atomic cutoff queue, blocking detection-queue send, no [neo-raw]/[neo-mic] diagnostics).

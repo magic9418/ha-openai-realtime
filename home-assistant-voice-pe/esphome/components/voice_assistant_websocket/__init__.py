@@ -18,6 +18,9 @@ VoiceAssistantWebSocket = voice_assistant_websocket_ns.class_(
 )
 
 CONF_SERVER_URL = "server_url"
+# NEO capture v3: the micro_wake_word instance whose stage-2 verdict + feature history ride with each upload.
+CONF_WAKE_DETECTOR = "wake_detector"
+_MicroWakeWord = cg.esphome_ns.namespace("micro_wake_word").class_("MicroWakeWord", cg.Component)
 # Detector channel/gain (what micro_wake_word consumes) for wake-trigger capture, plus metadata
 # reported with each captured trigger (wake_trigger_capture.h).
 CONF_ENROLLMENT_WAKE_CHANNEL = "enrollment_wake_channel"
@@ -59,6 +62,7 @@ CONFIG_SCHEMA = cv.Schema(
         ): cv.positive_time_period_milliseconds,
         cv.Optional(CONF_WAKE_VERDICT_TIMEOUT, default="3000ms"): cv.positive_time_period_milliseconds,
         cv.Optional(CONF_HOLD_DUCK, default=False): cv.boolean,
+        cv.Optional(CONF_WAKE_DETECTOR): cv.use_id(_MicroWakeWord),
         cv.Optional(CONF_ON_WAKE_ACCEPTED): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_CONNECTED): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_DISCONNECTED): automation.validate_automation(single=True),
@@ -98,6 +102,9 @@ async def to_code(config):
         )
     )
     cg.add(var.set_hold_duck(config[CONF_HOLD_DUCK]))
+    if CONF_WAKE_DETECTOR in config:
+        det = await cg.get_variable(config[CONF_WAKE_DETECTOR])
+        cg.add(var.set_wake_detector(det))
     cg.add(var.set_wake_verdict_timeout_ms(config[CONF_WAKE_VERDICT_TIMEOUT].total_milliseconds))
     cg.add(
         var.set_auto_stop_inactivity_ms(

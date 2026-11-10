@@ -153,7 +153,9 @@ class WakeTriggerRing {
   // CONSUMER (main loop). Copy the WT_BYTES that END at counter value `end_total`, oldest-first, into
   // the snapshot buffer. False if the ring has not yet held that much, `end_total` is not yet reached
   // or is too far behind the producer, or the producer outran the slack mid-copy.
-  bool snapshot_ending_at(uint32_t end_total) {
+  // NEO capture-v3: `dest` (WT_BYTES) lets capture-only jobs snapshot into their own buffers; default = snap_.
+  bool snapshot_ending_at(uint32_t end_total, uint8_t *dest = nullptr) {
+    uint8_t *out = dest != nullptr ? dest : this->snap_;
     if (ring_ == nullptr) return false;
     const uint32_t t1 = total_.load(std::memory_order_acquire);
     const uint32_t lag = wt_total_diff(t1, end_total);  // bytes the producer is ahead of the end point
@@ -162,8 +164,8 @@ class WakeTriggerRing {
     if (lag + WT_MAX_INFLIGHT > WT_SLACK) return false;  // oldest wanted bytes may already be overwritten
     const size_t start = (size_t(end_total % WT_RING_BYTES) + WT_RING_BYTES - WT_BYTES) % WT_RING_BYTES;
     const size_t first = std::min(WT_BYTES, WT_RING_BYTES - start);
-    std::memcpy(snap_, ring_ + start, first);
-    if (first < WT_BYTES) std::memcpy(snap_ + first, ring_, WT_BYTES - first);
+    std::memcpy(out, ring_ + start, first);
+    if (first < WT_BYTES) std::memcpy(out + first, ring_, WT_BYTES - first);
     const uint32_t t2 = total_.load(std::memory_order_acquire);
     const uint32_t advanced = wt_total_diff(t2, t1);
     return uint64_t(lag) + advanced + WT_MAX_INFLIGHT <= WT_SLACK;

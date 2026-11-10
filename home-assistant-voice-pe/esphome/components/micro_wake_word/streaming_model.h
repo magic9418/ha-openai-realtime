@@ -3,6 +3,7 @@
 #ifdef USE_ESP32
 
 #include "preprocessor_settings.h"
+#include "wake_features.h"
 
 #include "esphome/core/preferences.h"
 
@@ -23,6 +24,7 @@ struct DetectionEvent {
   uint8_t max_probability;
   uint8_t average_probability;
   bool blocked_by_vad = false;
+  Stage2Result stage2;  // NEO stage 2: scored on the inference task at the firing invocation
 };
 
 class StreamingModel {
@@ -52,6 +54,9 @@ class StreamingModel {
   bool is_enabled() const { return this->enabled_; }
 
   bool get_unprocessed_probability_status() const { return this->unprocessed_probability_status_; }
+  // NEO stage 2: output of the most recent invocation (0-255), and the model's invocation stride (frames).
+  uint8_t latest_probability() const { return this->recent_streaming_probabilities_[this->last_n_index_]; }
+  uint8_t get_stride() const { return this->stride_; }
 
   // Quantized probability cutoffs mapping 0.0 - 1.0 to 0 - 255
   uint8_t get_default_probability_cutoff() const { return this->default_probability_cutoff_; }
@@ -76,6 +81,7 @@ class StreamingModel {
   bool tensor_arena_size_probed_{false};
   bool unprocessed_probability_status_{false};
   uint8_t current_stride_step_{0};
+  uint8_t stride_{0};
   int16_t ignore_windows_{-MIN_SLICES_BEFORE_DETECTION};
 
   uint8_t default_probability_cutoff_;

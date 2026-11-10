@@ -9,6 +9,8 @@
 
 #include "esphome/components/audio/audio_transfer_buffer.h"
 
+#include <esp_heap_caps.h>
+
 #ifdef USE_OTA
 #include "esphome/components/ota/ota_backend.h"
 #endif
@@ -28,7 +30,8 @@ static const uint32_t RING_BUFFER_DURATION_MS = 120;
 // significantly more stack than other variants, causing stack protection faults at 3072.
 static const uint32_t INFERENCE_TASK_STACK_SIZE = 8192;
 #else
-static const uint32_t INFERENCE_TASK_STACK_SIZE = 3072;
+// NEO: 4096 (was 3072): stage 2 adds a second interpreter invoke (same kernels, one extra call frame) on this task.
+static const uint32_t INFERENCE_TASK_STACK_SIZE = 4096;
 #endif
 static const UBaseType_t INFERENCE_TASK_PRIORITY = 3;
 
@@ -69,6 +72,7 @@ static const LogString *micro_wake_word_state_to_string(State state) {
 
 void MicroWakeWord::dump_config() {
   ESP_LOGCONFIG(TAG, "microWakeWord:");
+  this->stage2_.dump_config();
   ESP_LOGCONFIG(TAG, "  models:");
   for (auto &model : this->wake_word_models_) {
     model->log_model_config();
@@ -107,6 +111,20 @@ void MicroWakeWord::setup() {
     ESP_LOGE(TAG, "Failed to create detection event queue");
     this->mark_failed();
     return;
+  }
+
+  // NEO stage 2: feature history (PSRAM, allocated ONCE here, never in the hot path) + the second-stage runner.
+  // Both fail open: without them mww behaves exactly as before.
+  {
+    uint8_t *hist_mem = static_cast<uint8_t *>(heap_caps_malloc(FeatureHistory::BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (hist_mem == nullptr || !this->history_.attach(hist_mem)) {
+      ESP_LOGE(TAG, "Feature history (%u B) could not be allocated in PSRAM; stage 2 and feature upload disabled",
+               (unsigned) FeatureHistory::BYTES);
+    } else {
+      ESP_LOGI(TAG, "Feature history ready: %u B PSRAM (%u frames)", (unsigned) FeatureHistory::BYTES,
+               (unsigned) FEATURE_HISTORY_FRAMES);
+    }
+    this->stage2_.setup(&this->history_);
   }
 
   this->microphone_source_->add_data_callback([this](const std::vector<uint8_t> &data) {
@@ -172,6 +190,7 @@ void MicroWakeWord::inference_task(void *params) {
     }
 
     if (!(xEventGroupGetBits(this_mww->event_group_) & ERROR_BITS)) {
+      this_mww->history_.reset();  // NEO: frame counter restarts with the task
       this_mww->microphone_source_->start();
       xEventGroupSetBits(this_mww->event_group_, EventGroupBits::TASK_RUNNING);
 
@@ -201,6 +220,8 @@ void MicroWakeWord::inference_task(void *params) {
               xEventGroupSetBits(this_mww->event_group_, EventGroupBits::ERROR_INFERENCE);
               break;
             }
+
+            this_mww->record_feature_frame_(features_buffer);  // NEO: history for stage 2 / feature upload
 
             // Process each model's probabilities and possibly send a Detection Event to the queue
             this_mww->process_probabilities_();
@@ -252,6 +273,8 @@ void MicroWakeWord::resume_task_() {
 }
 
 void MicroWakeWord::loop() {
+  this->stage2_.loop();
+
   uint32_t event_group_bits = xEventGroupGetBits(this->event_group_);
 
   if (event_group_bits & EventGroupBits::ERROR_MEMORY) {
@@ -337,6 +360,21 @@ void MicroWakeWord::loop() {
           // NEO (held-duck patch, see NEO_PATCH.md): expose the detection confidence to the YAML trigger.
           this->last_detection_average_ = detection_event.average_probability;
           this->last_detection_max_ = detection_event.max_probability;
+          this->last_stage2_ = detection_event.stage2;
+          if (detection_event.stage2.valid) {
+            ESP_LOGI(TAG, "stage2: score=%u threshold=%u mode=%s verdict=%s%s infer_ms=%u regime=%s",
+                     (unsigned) detection_event.stage2.score, (unsigned) detection_event.stage2.threshold,
+                     Stage2Runner::mode_name(detection_event.stage2.mode),
+                     detection_event.stage2.reject ? "reject" : "pass",
+                     detection_event.stage2.enforced ? " (ENFORCED: wake dropped)" : "",
+                     (unsigned) detection_event.stage2.infer_ms, detection_event.stage2.cold_idle ? "cold-idle" : "shadow-only");
+          }
+          if (detection_event.stage2.enforced) {
+            // Rejected by stage 2: no normal wake trigger. The detector already re-armed (probabilities reset,
+            // same ~1 s ignore window) on the inference task when it queued this event.
+            this->wake_word_rejected_trigger_.trigger(*detection_event.wake_word);
+            continue;
+          }
           this->wake_word_detected_trigger_.trigger(*detection_event.wake_word);
           if (this->stop_after_detection_) {
             this->stop();
@@ -393,6 +431,15 @@ void MicroWakeWord::set_state_(State state) {
   }
 }
 
+void MicroWakeWord::record_feature_frame_(const int8_t *features) {
+  uint8_t p = 0, v = 0;
+  if (!this->wake_word_models_.empty()) p = this->wake_word_models_[0]->latest_probability();
+#ifdef USE_MICRO_WAKE_WORD_VAD
+  v = this->vad_model_->latest_probability();
+#endif
+  this->history_.push(features, p, v);
+}
+
 bool MicroWakeWord::generate_features_(const int16_t *audio_buffer, size_t samples_available,
                                        int8_t features_buffer[PREPROCESSOR_FEATURE_SIZE], size_t *processed_samples) {
   *processed_samples = 0;
@@ -444,6 +491,8 @@ void MicroWakeWord::process_probabilities_() {
 #ifdef USE_MICRO_WAKE_WORD_VAD
         if (vad_state.detected) {
 #endif
+          // NEO stage 2: score THIS detection now (inference task, the firing invocation's last frame).
+          wake_word_state.stage2 = this->stage2_.evaluate(this->history_.frames_written() - 1);
           xQueueSend(this->detection_queue_, &wake_word_state, portMAX_DELAY);
 
           // Wake main loop immediately to process wake word detection

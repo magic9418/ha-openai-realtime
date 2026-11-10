@@ -5,6 +5,7 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/application.h"  // App.safe_reboot() for server-requested reboot
 #include "esphome/components/json/json_util.h"
+#include "esphome/components/micro_wake_word/micro_wake_word.h"
 #ifdef USE_NEO_INTERCOM
 #include "esphome/components/neo_intercom/neo_intercom.h"
 #endif
@@ -35,6 +36,7 @@ void VoiceAssistantWebSocket::setup() {
   this->preroll_init_();     // pre-allocate the PSRAM mic look-back (front-of-command clip fix)
   this->uplink_init_();      // PSRAM uplink ring + the one sender task (see the header INVARIANT)
   this->wake_trigger_init_();  // PSRAM detector-audio ring for wake-trigger capture (never internal RAM)
+  this->capture_v3_init_();    // PSRAM capture-only clips + feature windows (NEO capture v3)
   this->state_ = VOICE_ASSISTANT_WEBSOCKET_IDLE;
   
   // Register microphone data callback
@@ -52,6 +54,7 @@ void VoiceAssistantWebSocket::loop() {
   this->dispatch_deferred_();
   // Paced wake-trigger upload (<=1 frame per iteration). Main task only - never the mic task.
   this->wake_trigger_loop_();
+  this->co_loop_();  // capture-only uploads (own client + state machine; never touches state_)
   this->wake_verdict_loop_();
 
 #ifdef USE_NEO_INTERCOM
@@ -267,6 +270,8 @@ void VoiceAssistantWebSocket::dump_config() {
   ESP_LOGCONFIG(TAG, "  Microphone: %s", this->microphone_ ? "Yes" : "No");
   ESP_LOGCONFIG(TAG, "  Speaker: %s", this->speaker_ ? "Yes" : "No");
   ESP_LOGCONFIG(TAG, "  Audio ring buffer: %zu bytes (PSRAM)", AUDIO_RING_CAPACITY);
+  ESP_LOGCONFIG(TAG, "  Capture v3: %s, stage-2 detector %s", this->co_enabled_ ? "enabled (capture-only + features)" : "disabled",
+                this->detector_ != nullptr ? "linked" : "not linked");
 }
 
 void VoiceAssistantWebSocket::start() {
@@ -276,6 +281,7 @@ void VoiceAssistantWebSocket::start() {
   }
   
   ESP_LOGI(TAG, "Starting Voice Assistant WebSocket...");
+  this->co_preempt_();  // a real session wins over any capture-only upload, immediately
   this->audio_transport_ready_ = false;
   this->server_ready_pending_ = false;
   this->state_ = VOICE_ASSISTANT_WEBSOCKET_STARTING;
@@ -1217,6 +1223,7 @@ void VoiceAssistantWebSocket::wake_trigger_init_() {
 
 void VoiceAssistantWebSocket::capture_wake_trigger(bool bargein, uint8_t cutoff, const char *regime, int score_avg,
                                                    int score_max) {
+  this->co_preempt_();  // a real wake (stage-2 pass / button / ...) pre-empts a capture-only upload at once
   if (!this->wt_enabled_ || this->enrolling_) return;
   if (this->wt_state_.load() != WT_NONE) {
     ESP_LOGW(TAG, "Wake trigger: previous upload still in flight, skipping this capture");
@@ -1236,6 +1243,8 @@ void VoiceAssistantWebSocket::capture_wake_trigger(bool bargein, uint8_t cutoff,
   this->wt_score_avg_ = (score_avg >= 0 && score_avg <= 255) ? (int16_t) score_avg : (int16_t) -1;
   this->wt_score_max_ = (score_max >= 0 && score_max <= 255) ? (int16_t) score_max : (int16_t) -1;
   snprintf(this->wt_regime_, sizeof(this->wt_regime_), "%s", regime != nullptr ? regime : "fixed");
+  this->capture_s2_meta_(this->wt_s2_, this->wt_fire_frame_);  // stage-2 verdict of THIS detection
+  this->wt_feat_ok_ = false;
   this->wt_captured_ms_ = millis();
   this->wt_ready_ms_ = 0;
   this->wt_seq_ = 0;
@@ -1304,6 +1313,10 @@ void VoiceAssistantWebSocket::wake_trigger_loop_() {
       this->wt_state_.store(WT_NONE);
       return;
     }
+    // NEO capture v3: the feature window (198 before + up to 50 after the fire frame) is frozen NOW, with the audio.
+    this->wt_feat_ok_ = this->wt_s2_.follow_features && this->detector_ != nullptr && this->wt_feat_ != nullptr &&
+                        this->detector_->copy_feature_upload(this->wt_fire_frame_, 50, this->wt_feat_, &this->wt_fwin_);
+    this->wt_s2_.follow_features = this->wt_feat_ok_;
     this->wt_state_.store(WT_WAIT_MARKER);
     return;
   }
@@ -1323,30 +1336,11 @@ void VoiceAssistantWebSocket::wake_trigger_loop_() {
       if (since < WT_COLD_SETTLE_MS) return;
       if (this->uplink_fill_ > 2 * UPLINK_SEND_CHUNK && since < WT_COLD_SETTLE_MS + 1000) return;
     }
-    const int n0 = snprintf(
-        buf, WT_JSON_BYTES,
-        "{\"type\":\"wake_trigger_start\",\"kind\":\"%s\",\"sample_rate\":%u,\"samples\":%u,\"chunks\":%u,"
-        "\"channel\":%u,\"gain_factor\":%u,\"cutoff\":%u,\"window\":%u,\"regime\":\"%s\",\"model\":\"%s\","
-        "\"fw\":\"%s\",\"post_trigger_ms\":%u,\"pre_trigger_ms\":%u",
-        this->wt_bargein_ ? "bargein" : "cold", (unsigned) WT_SAMPLE_RATE, (unsigned) WT_SAMPLES,
-        (unsigned) wt_chunk_count(WT_BYTES), (unsigned) this->enrollment_wake_channel_,
-        (unsigned) this->enrollment_wake_gain_factor_, (unsigned) this->wt_cutoff_, (unsigned) this->wt_window_,
-        this->wt_regime_, this->wt_model_.c_str(), this->wt_fw_.c_str(), (unsigned) WT_POST_MS,
-        (unsigned) WT_PRE_MS);
-    int n = n0;
-    if (n0 > 0 && size_t(n0) < WT_JSON_BYTES && this->wt_score_avg_ >= 0) {
-      // detector_score = sliding-window MEAN probability at detection (0-255, the cutoff scale);
-      // detector_score_max = highest single inference in that window (0-255).
-      n = snprintf(buf + n0, WT_JSON_BYTES - n0, ",\"detector_score\":%d,\"detector_score_max\":%d",
-                   (int) this->wt_score_avg_, (int) this->wt_score_max_);
-      n = (n > 0) ? n0 + n : -1;
-    }
-    if (n > 0 && size_t(n) + 1 < WT_JSON_BYTES) {
-      buf[n++] = '}';
-      buf[n] = '\0';
-    } else {
-      n = -1;
-    }
+    const int n = (int) wf_build_trigger_start(
+        buf, WT_JSON_BYTES, this->wt_bargein_, false, WT_SAMPLE_RATE, WT_SAMPLES, (uint32_t) wt_chunk_count(WT_BYTES),
+        this->enrollment_wake_channel_, this->enrollment_wake_gain_factor_, this->wt_cutoff_, this->wt_window_,
+        this->wt_regime_, this->wt_model_.c_str(), this->wt_fw_.c_str(), WT_POST_MS, WT_PRE_MS, this->wt_score_avg_,
+        this->wt_score_max_, this->wt_s2_);
     if (n <= 0 || size_t(n) >= WT_JSON_BYTES ||
         esp_websocket_client_send_text(this->websocket_client_, buf, n, pdMS_TO_TICKS(50)) != n) {
       ESP_LOGW(TAG, "Wake trigger: start frame not sent; dropping upload");
@@ -1362,19 +1356,24 @@ void VoiceAssistantWebSocket::wake_trigger_loop_() {
   // WT_SENDING: one frame per loop iteration, >= WT_PACE_MS apart.
   if ((int32_t)(now - this->wt_next_ms_) < 0) return;
   const size_t chunks = wt_chunk_count(WT_BYTES);
+  const bool feats = this->wt_s2_.follow_features && this->wt_feat_ok_;
+  const size_t nfeat = feats ? wf_feature_frame_count(this->wt_fwin_) : 0;
+  const size_t total_frames = chunks + 1 + nfeat;  // audio chunks, end, then (optional) feature frames
   int n;
   if (this->wt_seq_ < chunks) {
     n = (int) wt_build_chunk_json(this->wt_ring_.snapshot_data(), WT_BYTES, this->wt_seq_, buf, WT_JSON_BYTES);
-  } else {
+  } else if (this->wt_seq_ == chunks) {
     n = snprintf(buf, WT_JSON_BYTES, "{\"type\":\"wake_trigger_end\",\"samples\":%u}", (unsigned) WT_SAMPLES);
+  } else {
+    n = (int) wf_build_feature_frame(this->wt_seq_ - chunks - 1, this->wt_feat_, this->wt_fwin_, buf, WT_JSON_BYTES);
   }
   if (n <= 0 || esp_websocket_client_send_text(this->websocket_client_, buf, n, pdMS_TO_TICKS(50)) != n) {
     ESP_LOGW(TAG, "Wake trigger: frame %u not sent; aborting upload", (unsigned) this->wt_seq_);
     this->wt_state_.store(WT_NONE);
     return;
   }
-  if (this->wt_seq_ >= chunks) {
-    ESP_LOGI(TAG, "Wake trigger upload complete (%u chunks)", (unsigned) chunks);
+  if (this->wt_seq_ + 1 >= total_frames) {
+    ESP_LOGI(TAG, "Wake trigger upload complete (%u chunks%s)", (unsigned) chunks, feats ? " + features" : "");
     this->wt_state_.store(WT_NONE);
     return;
   }
@@ -1683,6 +1682,11 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
             this->report_audio_free_(true);
           }
           // loop() opens the microphone path after this receive callback returns.
+          {
+            // NEO stage 2: server-pushed mode/threshold (absent key = change nothing). Persisted by the detector.
+            uint8_t s2_mode = 0, s2_thr = 0;
+            if (wf_parse_wake_stage2(message, s2_mode, s2_thr)) this->apply_wake_stage2_(s2_mode, s2_thr);
+          }
           this->server_ready_pending_ = true;
         } else if (message.find("\"type\":\"enroll\"") != std::string::npos ||
                    message.find("\"type\": \"enroll\"") != std::string::npos) {

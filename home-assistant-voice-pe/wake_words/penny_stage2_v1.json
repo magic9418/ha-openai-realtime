@@ -1,0 +1,517 @@
+{
+ "model_name": "penny_stage2_v1",
+ "file": "penny_stage2_v1.tflite",
+ "sha256": "862be8f99766ede9df928a2d3b3a34cedc30962aed5c32e39a07eb3412943c73",
+ "size_bytes": 21976,
+ "date": "2026-11-10",
+ "purpose": "second-stage real-wake vs false-wake veto, run once per stage-1 detection (not streaming)",
+ "input": {
+  "tensor_shape": [
+   1,
+   100,
+   40,
+   1
+  ],
+  "frames_T": 100,
+  "channels": 40,
+  "dtype": "int8",
+  "scale": 1.0,
+  "zero_point": 0,
+  "layout": "time-major, oldest frame first; frame t = the 40 int8 features micro_wake_word feeds the detector (uint16 feature*256/666-128, clamp)",
+  "feature_spec": "ESPHome micro_wake_word int8 features, 10 ms step, window ends at detection frame (the frame of the stage-1 firing invocation)",
+  "window_seconds": 1.0
+ },
+ "output": {
+  "tensor_shape": [
+   1,
+   1
+  ],
+  "dtype": "int8",
+  "scale": 0.00390625,
+  "zero_point": -128,
+  "score_0_255": "int8 + 128 (= round(256 * sigmoid(logit/3)))",
+  "note": "sigmoid is applied to logit/3 (temperature 3 folded into the final dense layer) so that the decision region stays inside the 8-bit sigmoid range"
+ },
+ "ops": [
+  "CONV_2D x4",
+  "DEPTHWISE_CONV_2D x3",
+  "MAX_POOL_2D x1 (full-map, 7x5)",
+  "FULLY_CONNECTED x1",
+  "LOGISTIC x1"
+ ],
+ "tflm_resolver": [
+  "AddConv2D",
+  "AddDepthwiseConv2D",
+  "AddMaxPool2D",
+  "AddFullyConnected",
+  "AddLogistic"
+ ],
+ "layers": "conv5x3/2 16ch, dw3x3/2, pw32, dw3x3/2, pw64, dw3x3/(2,1), pw64, global max pool, dense 1, logistic; BN folded, /64 input scaling folded into conv1; padding SAME",
+ "parameters": {
+  "trained_with_batchnorm": 8833,
+  "deployed_folded": 8257
+ },
+ "macs_per_inference": "~0.72 M",
+ "arena": {
+  "peak_live_activations_bytes": 20000,
+  "largest_tensors": [
+   "conv1 out 1x50x20x16 = 16000 B",
+   "input 4000 B",
+   "dw1 out 1x25x10x16 = 4000 B"
+  ],
+  "safe_tensor_arena_bytes": 40960,
+  "note": "measure arena_used_bytes() on device; 40 KB leaves ~2x for TFLM overhead/ESP-NN scratch"
+ },
+ "float_vs_int8_agreement_0_255_units": {
+  "nominal": {
+   "n": 885,
+   "max": 4.135398864746094,
+   "mean": 0.7106497424470503,
+   "p99": 3.4275543212890622
+  },
+  "augmented": {
+   "n": 2700,
+   "max": 5.3354949951171875,
+   "mean": 0.740952730178833,
+   "p99": 3.54428768157959
+  }
+ },
+ "thresholds_from_leave_one_day_out": {
+  "units": "0-255 score; accept (keep as real wake) if score >= threshold",
+  "trigger_aligned_offset0": {
+   "ALL": {
+    "keep_100": {
+     "threshold_0_255": 15,
+     "real_kept_pct": 100.0,
+     "false_removed_pct": 23.7,
+     "false_removed_ci95": "21-75",
+     "n_real": 101,
+     "n_false": 725
+    },
+    "keep_98": {
+     "threshold_0_255": 29,
+     "real_kept_pct": 98.0,
+     "false_removed_pct": 51.9,
+     "false_removed_ci95": "23-88",
+     "n_real": 101,
+     "n_false": 725
+    },
+    "keep_95": {
+     "threshold_0_255": 66,
+     "real_kept_pct": 95.0,
+     "false_removed_pct": 84.8,
+     "false_removed_ci95": "50-95",
+     "n_real": 101,
+     "n_false": 725
+    },
+    "keep_90": {
+     "threshold_0_255": 112,
+     "real_kept_pct": 90.1,
+     "false_removed_pct": 94.1,
+     "false_removed_ci95": "85-98",
+     "n_real": 101,
+     "n_false": 725
+    }
+   },
+   "Sat1": {
+    "keep_100": {
+     "threshold_0_255": 15,
+     "real_kept_pct": 100.0,
+     "false_removed_pct": 25.6,
+     "false_removed_ci95": "23-90",
+     "n_real": 41,
+     "n_false": 504
+    },
+    "keep_98": {
+     "threshold_0_255": 15,
+     "real_kept_pct": 100.0,
+     "false_removed_pct": 25.6,
+     "false_removed_ci95": "23-88",
+     "n_real": 41,
+     "n_false": 504
+    },
+    "keep_95": {
+     "threshold_0_255": 45,
+     "real_kept_pct": 95.1,
+     "false_removed_pct": 76.4,
+     "false_removed_ci95": "24-97",
+     "n_real": 41,
+     "n_false": 504
+    },
+    "keep_90": {
+     "threshold_0_255": 106,
+     "real_kept_pct": 90.2,
+     "false_removed_pct": 94.6,
+     "false_removed_ci95": "42-99",
+     "n_real": 41,
+     "n_false": 504
+    }
+   },
+   "PE": {
+    "keep_100": {
+     "threshold_0_255": 29,
+     "real_kept_pct": 100.0,
+     "false_removed_pct": 42.5,
+     "false_removed_ci95": "37-90",
+     "n_real": 60,
+     "n_false": 221
+    },
+    "keep_98": {
+     "threshold_0_255": 58,
+     "real_kept_pct": 98.3,
+     "false_removed_pct": 78.3,
+     "false_removed_ci95": "38-94",
+     "n_real": 60,
+     "n_false": 221
+    },
+    "keep_95": {
+     "threshold_0_255": 93,
+     "real_kept_pct": 95.0,
+     "false_removed_pct": 89.6,
+     "false_removed_ci95": "75-97",
+     "n_real": 60,
+     "n_false": 221
+    },
+    "keep_90": {
+     "threshold_0_255": 112,
+     "real_kept_pct": 91.7,
+     "false_removed_pct": 92.3,
+     "false_removed_ci95": "80-100",
+     "n_real": 60,
+     "n_false": 221
+    }
+   },
+   "kitchen": {
+    "keep_100": {
+     "threshold_0_255": 15,
+     "real_kept_pct": 100.0,
+     "false_removed_pct": 26.3,
+     "false_removed_ci95": "22-93",
+     "n_real": 29,
+     "n_false": 365
+    },
+    "keep_98": {
+     "threshold_0_255": 15,
+     "real_kept_pct": 100.0,
+     "false_removed_pct": 26.3,
+     "false_removed_ci95": "22-98",
+     "n_real": 29,
+     "n_false": 365
+    },
+    "keep_95": {
+     "threshold_0_255": 21,
+     "real_kept_pct": 96.6,
+     "false_removed_pct": 40.3,
+     "false_removed_ci95": "23-99",
+     "n_real": 29,
+     "n_false": 365
+    },
+    "keep_90": {
+     "threshold_0_255": 71,
+     "real_kept_pct": 93.1,
+     "false_removed_pct": 88.5,
+     "false_removed_ci95": "25-100",
+     "n_real": 29,
+     "n_false": 365
+    }
+   },
+   "masterbedroom": {
+    "keep_100": {
+     "threshold_0_255": 45,
+     "real_kept_pct": 100.0,
+     "false_removed_pct": 76.3,
+     "false_removed_ci95": "70-96",
+     "n_real": 12,
+     "n_false": 139
+    },
+    "keep_98": {
+     "threshold_0_255": 45,
+     "real_kept_pct": 100.0,
+     "false_removed_pct": 76.3,
+     "false_removed_ci95": "71-97",
+     "n_real": 12,
+     "n_false": 139
+    },
+    "keep_95": {
+     "threshold_0_255": 45,
+     "real_kept_pct": 100.0,
+     "false_removed_pct": 76.3,
+     "false_removed_ci95": "70-97",
+     "n_real": 12,
+     "n_false": 139
+    },
+    "keep_90": {
+     "threshold_0_255": 106,
+     "real_kept_pct": 91.7,
+     "false_removed_pct": 90.6,
+     "false_removed_ci95": "72-99",
+     "n_real": 12,
+     "n_false": 139
+    }
+   }
+  },
+  "pooled_offsets": {
+   "ALL": {
+    "keep_100": {
+     "threshold_0_255": 4,
+     "real_kept_pct": 100.0,
+     "false_removed_pct": 2.7,
+     "false_removed_ci95": "2-47",
+     "n_real": 262,
+     "n_false": 1984
+    },
+    "keep_98": {
+     "threshold_0_255": 31,
+     "real_kept_pct": 98.1,
+     "false_removed_pct": 54.4,
+     "false_removed_ci95": "35-87",
+     "n_real": 262,
+     "n_false": 1984
+    },
+    "keep_95": {
+     "threshold_0_255": 79,
+     "real_kept_pct": 95.0,
+     "false_removed_pct": 89.7,
+     "false_removed_ci95": "72-96",
+     "n_real": 262,
+     "n_false": 1984
+    },
+    "keep_90": {
+     "threshold_0_255": 129,
+     "real_kept_pct": 90.1,
+     "false_removed_pct": 96.8,
+     "false_removed_ci95": "95-98",
+     "n_real": 262,
+     "n_false": 1984
+    }
+   },
+   "Sat1": {
+    "keep_100": {
+     "threshold_0_255": 4,
+     "real_kept_pct": 100.0,
+     "false_removed_pct": 2.7,
+     "false_removed_ci95": "2-49",
+     "n_real": 104,
+     "n_false": 1340
+    },
+    "keep_98": {
+     "threshold_0_255": 21,
+     "real_kept_pct": 98.1,
+     "false_removed_pct": 39.3,
+     "false_removed_ci95": "2-89",
+     "n_real": 104,
+     "n_false": 1340
+    },
+    "keep_95": {
+     "threshold_0_255": 45,
+     "real_kept_pct": 95.2,
+     "false_removed_pct": 76.6,
+     "false_removed_ci95": "38-96",
+     "n_real": 104,
+     "n_false": 1340
+    },
+    "keep_90": {
+     "threshold_0_255": 106,
+     "real_kept_pct": 90.4,
+     "false_removed_pct": 95.2,
+     "false_removed_ci95": "76-98",
+     "n_real": 104,
+     "n_false": 1340
+    }
+   },
+   "PE": {
+    "keep_100": {
+     "threshold_0_255": 29,
+     "real_kept_pct": 100.0,
+     "false_removed_pct": 42.9,
+     "false_removed_ci95": "40-80",
+     "n_real": 158,
+     "n_false": 644
+    },
+    "keep_98": {
+     "threshold_0_255": 66,
+     "real_kept_pct": 98.1,
+     "false_removed_pct": 80.4,
+     "false_removed_ci95": "45-92",
+     "n_real": 158,
+     "n_false": 644
+    },
+    "keep_95": {
+     "threshold_0_255": 97,
+     "real_kept_pct": 95.6,
+     "false_removed_pct": 91.3,
+     "false_removed_ci95": "79-98",
+     "n_real": 158,
+     "n_false": 644
+    },
+    "keep_90": {
+     "threshold_0_255": 148,
+     "real_kept_pct": 90.5,
+     "false_removed_pct": 97.7,
+     "false_removed_ci95": "93-99",
+     "n_real": 158,
+     "n_false": 644
+    }
+   },
+   "kitchen": {
+    "keep_100": {
+     "threshold_0_255": 4,
+     "real_kept_pct": 100.0,
+     "false_removed_pct": 3.2,
+     "false_removed_ci95": "2-52",
+     "n_real": 70,
+     "n_false": 1012
+    },
+    "keep_98": {
+     "threshold_0_255": 15,
+     "real_kept_pct": 98.6,
+     "false_removed_pct": 24.9,
+     "false_removed_ci95": "3-89",
+     "n_real": 70,
+     "n_false": 1012
+    },
+    "keep_95": {
+     "threshold_0_255": 26,
+     "real_kept_pct": 95.7,
+     "false_removed_pct": 49.0,
+     "false_removed_ci95": "23-98",
+     "n_real": 70,
+     "n_false": 1012
+    },
+    "keep_90": {
+     "threshold_0_255": 73,
+     "real_kept_pct": 91.4,
+     "false_removed_pct": 90.3,
+     "false_removed_ci95": "39-100",
+     "n_real": 70,
+     "n_false": 1012
+    }
+   },
+   "masterbedroom": {
+    "keep_100": {
+     "threshold_0_255": 45,
+     "real_kept_pct": 100.0,
+     "false_removed_pct": 77.4,
+     "false_removed_ci95": "74-94",
+     "n_real": 34,
+     "n_false": 328
+    },
+    "keep_98": {
+     "threshold_0_255": 45,
+     "real_kept_pct": 100.0,
+     "false_removed_pct": 77.4,
+     "false_removed_ci95": "74-94",
+     "n_real": 34,
+     "n_false": 328
+    },
+    "keep_95": {
+     "threshold_0_255": 94,
+     "real_kept_pct": 97.1,
+     "false_removed_pct": 90.5,
+     "false_removed_ci95": "75-96",
+     "n_real": 34,
+     "n_false": 328
+    },
+    "keep_90": {
+     "threshold_0_255": 111,
+     "real_kept_pct": 91.2,
+     "false_removed_pct": 92.4,
+     "false_removed_ci95": "89-97",
+     "n_real": 34,
+     "n_false": 328
+    }
+   }
+  }
+ },
+ "device_faithful_heldout": {
+  "procedure": "stage-1 fire -> last 100 frames ending at the firing frame -> held-out LODO float model; recommended thresholds",
+  "rows": [
+   {
+    "device": "ALL",
+    "thr": "15/29",
+    "n_real": 97,
+    "n_false": 501,
+    "real_kept": 99.0,
+    "real_ci": "97-100",
+    "false_removed": 29.2,
+    "false_ci": "26-33"
+   },
+   {
+    "device": "Sat1",
+    "thr": "15",
+    "n_real": 39,
+    "n_false": 360,
+    "real_kept": 97.6,
+    "real_ci": "93-100",
+    "false_removed": 24.7,
+    "false_ci": "21-28"
+   },
+   {
+    "device": "PE",
+    "thr": "29",
+    "n_real": 58,
+    "n_false": 141,
+    "real_kept": 100.0,
+    "real_ci": "100-100",
+    "false_removed": 40.6,
+    "false_ci": "34-48"
+   }
+  ]
+ },
+ "recommended_default_threshold": {
+  "Satellite1": 15,
+  "VoicePE": 29,
+  "basis": "the 0-255 threshold at which NO real wake was lost in leave-one-day-out at trigger-aligned windows (Sat1 41 reals, PE 60 reals), confirmed under the device-faithful held-out replay (Sat1 97.6% real kept / 24.7% false removed; PE 100% / 40.6%). Conservative = rests on the minimum real score, i.e. 1-3 clips; expect +-30 points of uncertainty on false-removed. Next step up (Sat1 21, PE 66) = ~98% kept / 39% (Sat1), 97% / 78% (PE)."
+ },
+ "training": {
+  "seed_chosen": 5,
+  "seed_selection": "5 seeds each with a full 35-day LODO; the seed with the MEDIAN offset-averaged LODO AUC was shipped",
+  "lodo_per_seed": [
+   {
+    "seed": 1,
+    "auc0": 0.9774530556503926,
+    "auc_mean_offsets": 0.983430847152906,
+    "fr98": 68.96551724137932,
+    "fr95": 85.10344827586206
+   },
+   {
+    "seed": 2,
+    "auc0": 0.9648480710139979,
+    "auc_mean_offsets": 0.9713377354783135,
+    "fr98": 57.655172413793096,
+    "fr95": 81.37931034482759
+   },
+   {
+    "seed": 3,
+    "auc0": 0.9749948787982247,
+    "auc_mean_offsets": 0.9785743729351626,
+    "fr98": 72.9655172413793,
+    "fr95": 92.41379310344827
+   },
+   {
+    "seed": 4,
+    "auc0": 0.9843086377603277,
+    "auc_mean_offsets": 0.98634654573555,
+    "fr98": 85.10344827586206,
+    "fr95": 91.72413793103448
+   },
+   {
+    "seed": 5,
+    "auc0": 0.968125640150222,
+    "auc_mean_offsets": 0.9805838319205807,
+    "fr98": 53.241379310344826,
+    "fr95": 84.82758620689656
+   }
+  ],
+  "labelled_clips": 826,
+  "real": 101,
+  "false": 725,
+  "real_v2": 30,
+  "days": 35,
+  "extra_training_only_positives": 13,
+  "extra_source": "incoming/kitchen_waketap_candidate_20261001_raw/{positive_train,positive_holdout,positive_excluded}/*.wav (kitchen Sat1 wake-tap, 16 kHz), windows whose stage-1 mean >=235 (13 of 25); training only, never evaluated",
+  "augmentation": "8 alignments x gain -6/0/+6 dB x trigger jitter -100..+200 ms (older clips only <= 0 ms)",
+  "optimiser": "AdamW 3e-3 wd 1e-3, 30 epochs, bs 64, pos_weight = neg/pos, no hyper-parameter tuning on folds"
+ },
+ "labels": "human_label real/false from the Console; 59 unlabeled clips excluded"
+}
