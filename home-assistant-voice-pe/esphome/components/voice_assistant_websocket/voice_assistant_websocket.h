@@ -17,6 +17,7 @@
 #include <vector>
 #include <queue>
 #include <atomic>
+#include "wake_timing.h"
 #include "wake_capture_sample.h"
 #include "wake_trigger_capture.h"
 
@@ -51,8 +52,6 @@ class VoiceAssistantWebSocket : public Component {
   // place the task is asked to exit and is joined.
   void on_shutdown() override;
 
-  // Detector channel/gain micro_wake_word consumes (the wake-trigger capture converts the shared mic
-  // frames exactly like it: channel select + Q31->Q25 gain/clamp). PE: channel 1, gain 4.
   void set_enrollment_wake_channel(uint8_t channel) { this->enrollment_wake_channel_ = channel; }
   void set_enrollment_wake_gain_factor(uint8_t gain) { this->enrollment_wake_gain_factor_ = gain; }
   // Wake-trigger capture metadata (compile-time facts about the detector; see capture_wake_trigger).
@@ -67,6 +66,11 @@ class VoiceAssistantWebSocket : public Component {
   // Auto-stop the session after this many ms of speaker (bot) inactivity.
   // Configurable via the `auto_stop_inactivity_ms` component option (see __init__.py).
   void set_auto_stop_inactivity_ms(uint32_t ms) { this->auto_stop_inactivity_ms_ = ms; }
+  // Per-device knobs (see __init__.py). The component source is shared byte-for-byte between the
+  // Satellite1 and Voice PE repos (voice-pe/.../shared_components.lock.json), so hardware
+  // differences are expressed through these options, never through divergent text.
+  void set_websocket_buffer_size(uint32_t bytes) { this->websocket_buffer_size_ = bytes; }
+  void set_wake_open_delay_ms(uint32_t ms) { this->wake_open_delay_ms_ = ms; }
   
   void start();
   void stop();
@@ -138,15 +142,42 @@ class VoiceAssistantWebSocket : public Component {
   void wake_trigger_init_();
   void wake_trigger_loop_();   // main loop: paced upload state machine
   void wake_trigger_abort_() { this->wt_state_.store(WT_NONE); }  // any task; just drops the job
-  void enter_enrollment_(bool wake_tap);               // pin mic open, disarm wake+stop models
+  void enter_enrollment_(bool wake_tap);                 // pin mic open, disarm wake+stop models
   void exit_enrollment_();                  // restore normal wake/stop-model operation
-  void send_audio_chunk_(const uint8_t *data, size_t len);
+  void send_audio_chunk_(const uint8_t *data, size_t len, uint32_t epoch);
   void process_received_audio_(const uint8_t *data, size_t len);
   void on_microphone_data_(const std::vector<uint8_t> &data);
   static void websocket_event_handler_(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
   void handle_websocket_event_(esp_websocket_event_id_t event_id, esp_websocket_event_data_t *event_data);
+  // WEBSOCKET task. Reassembles a data frame that esp_websocket_client delivered in chunks.
+  void handle_data_frame_(const esp_websocket_event_data_t *event_data);
+  // WEBSOCKET task. Parses one COMPLETE server text message once and dispatches on its "type".
+  void handle_text_message_(const uint8_t *data, size_t len);
+  void push_binary_audio_(const uint8_t *data, size_t len);  // whole 16-bit samples only
   
   std::string server_url_;
+  // esp_websocket_client RX/TX buffer. Frames larger than this arrive in several chunks.
+  uint32_t websocket_buffer_size_{4096};
+
+  // ---- Inbound frame reassembly (WEBSOCKET task only; no locks needed) ------------------------
+  // Text: a server message larger than the client buffer arrives as several chunks. Chunks are
+  // gathered here (allocated once, PSRAM) and parsed only when complete. A message that does not fit
+  // is dropped whole with a warning; nothing ever writes past RX_TEXT_MAX.
+  static const size_t RX_TEXT_MAX = 16 * 1024;
+  char *rx_text_{nullptr};
+  size_t rx_text_len_{0};
+  bool rx_text_overflow_{false};
+  // Kind of the message currently being received: 0 none, 1 text, 2 binary.
+  uint8_t rx_kind_{0};
+  // Binary: a chunk can end mid 16-bit sample. The odd trailing byte waits here for the next chunk
+  // so only whole samples enter the speaker ring. Reset at every new message.
+  uint8_t rx_odd_byte_{0};
+  bool rx_has_odd_byte_{false};
+  // Server-issued local Drop In request, read by the main loop only after
+  // stop() releases the assistant speaker. Protected by deferred_lock_.
+  std::string pending_dropin_room_;
+  std::string pending_dropin_request_id_;
+  uint32_t pending_dropin_deadline_ms_{0};
   microphone::Microphone *microphone_{nullptr};
   speaker::Speaker *speaker_{nullptr};
   
@@ -155,11 +186,13 @@ class VoiceAssistantWebSocket : public Component {
 #else
   void *websocket_client_{nullptr};
 #endif
-  VoiceAssistantWebSocketState state_{VOICE_ASSISTANT_WEBSOCKET_IDLE};
-  // CONNECTED means the WebSocket is open, not that the server's upstream
-  // Realtime session is ready. Keep microphone backlog gated until `hello`
-  // has returned and the websocket receive callback has unwound.
+  std::atomic<VoiceAssistantWebSocketState> state_{VOICE_ASSISTANT_WEBSOCKET_IDLE};
   std::atomic<bool> audio_transport_ready_{false};
+  // The TCP/WebSocket handshake completes before the session server has finished opening its
+  // upstream Realtime session.  Do not release the queued mic look-back from the websocket event
+  // task: wait for the server's small `hello` frame, then let loop() open the uplink after the
+  // receive callback has returned.  This avoids overlapping the first inbound frame with the
+  // initial ~50 KB mic burst on ESP-IDF's shared websocket transport.
   std::atomic<bool> server_ready_pending_{false};
   static const uint32_t SERVER_READY_FALLBACK_MS = 5000;
   
@@ -249,37 +282,46 @@ class VoiceAssistantWebSocket : public Component {
   uint32_t last_audio_send_{0};
   uint32_t last_audio_receive_{0};
   static const uint32_t AUDIO_SEND_INTERVAL_MS = 100;  // Send 100ms chunks
-  static const uint32_t MICROPHONE_SAMPLE_RATE = 16000;  // 16kHz from microphone (required by micro_wake_word)
+  static const uint32_t MICROPHONE_SAMPLE_RATE = 16000;  // va_ws does NOT own the i2s (48kHz); it taps micro_wake_word's
+                                                         // SHARED microphone source, which is resampled to 16kHz for mww.
+                                                         // Measured on HW: ~15.9k frames/s reach on_microphone_data_ (128KB/s
+                                                         // 32-bit stereo), i.e. 16kHz — not 48kHz. The 48000 assumption made
+                                                         // the ratio-generic resampler DOWNsample 2:1 → a fast/pitched-up
+                                                         // stream OpenAI couldn't parse (turns=0). 16000 → correct 16->24 upsample.
   static const uint32_t INPUT_SAMPLE_RATE = 24000;       // 24kHz for OpenAI input (non-beta API requirement)
   static const uint32_t OUTPUT_SAMPLE_RATE = 24000;    // 24kHz for OpenAI output
   static const uint32_t BYTES_PER_SAMPLE = 2;          // 16-bit = 2 bytes
   static const uint32_t INPUT_BUFFER_SIZE = (INPUT_SAMPLE_RATE * BYTES_PER_SAMPLE * AUDIO_SEND_INTERVAL_MS) / 1000;
 
-  // Mic LOOK-BACK — the uplink counterpart of the assistant-audio ring above (ported from Sat1,
-  // 2026-08-21).
+  // Mic LOOK-BACK — the uplink counterpart of the assistant-audio ring above (2026-08-21).
   //
-  // A buffer armed by start() cannot fix the front-of-command clip: micro_wake_word can only report
-  // "Neo" once the whole word has passed through its sliding window, so start() runs a few hundred ms
-  // AFTER the user finished saying it. In a run-together "Neo play some alternative music" the words
-  // "play some" are spoken INSIDE that detection latency — before start(). Nor can wake_open_delay_ms
-  // help: every one of these gates sits downstream of a wake that has, by construction, already
-  // happened.
+  // v1 of this buffer was armed by start() and only covered wake→WEBSOCKET_EVENT_CONNECTED. That
+  // closed a real gap but NOT the reported one, and the device still clipped: micro_wake_word can
+  // only report "Neo" once the whole word has passed through its sliding window, so start() runs a
+  // few hundred ms AFTER the user finished saying it. In a run-together "Neo play some alternative
+  // music" the words "play some" are spoken INSIDE that detection latency — before start(), before
+  // the buffer was armed — so arming at the wake can never recover them. Nor can wake_open_delay_ms:
+  // every one of these gates sits downstream of a wake that has, by construction, already happened.
   //
   // So this is a CIRCULAR look-back that fills continuously while idle (the mic callback is
   // registered unconditionally in setup() and micro_wake_word keeps the mic running, so the frames
-  // are already arriving — we simply used to discard them). At the wake we already hold the preceding
-  // PREROLL_MS, wake word and all, and flush it oldest-first ahead of the live stream.
+  // are already arriving — v1 simply discarded them). At the wake we already hold the preceding
+  // LOOKBACK_MS, wake word and all, and flush it oldest-first ahead of the live stream.
   //
   // INVARIANT: the ring holds only CONTIGUOUS, recently-heard room audio. Every path that drops a
   // frame (bot speaking, mic gate) resets it, so a flush can never prepend Neo's own reply echo or
   // a stale fragment from minutes ago onto the next command.
   static const uint32_t PREROLL_MS = 1000;                     // look-back depth: wake word + detection latency
   static const uint32_t BYTES_PER_MS_24K = (INPUT_SAMPLE_RATE * BYTES_PER_SAMPLE) / 1000;  // 48 B/ms
-  static const size_t PREROLL_CAPACITY = PREROLL_MS * BYTES_PER_MS_24K;                    // 48 KB
+  // One second of pre-wake history plus two seconds of connection backlog.
+  static const size_t PREROLL_CAPACITY = 3 * PREROLL_MS * BYTES_PER_MS_24K;
   static const size_t PREROLL_CHUNK = INPUT_BUFFER_SIZE;       // flush in normal-sized frames
   uint8_t *preroll_{nullptr};
-  size_t preroll_fill_{0};            // bytes held (saturates at PREROLL_CAPACITY)
-  size_t preroll_head_{0};            // write cursor; once full this is also the OLDEST byte
+  WakeHistoryCursor preroll_cursor_;
+  std::atomic<int32_t> pending_preroll_ms_{-1};  // prefix sent by uplink task before binary audio
+  std::atomic<uint32_t> pending_preroll_epoch_{0};
+  std::atomic<uint32_t> session_epoch_{0};
+  std::atomic<bool> transport_failed_{false};
   // preroll_head_/preroll_fill_ are written by the MIC task (push/flush) and reset from the MAIN
   // task (init) and the WEBSOCKET task (stop()). Unserialized, a reset landing between the head
   // update and the fill update in preroll_push_ resurrects a stale fill over a rewound head, and a
@@ -292,7 +334,7 @@ class VoiceAssistantWebSocket : public Component {
   SemaphoreHandle_t preroll_lock_{nullptr};
   void preroll_init_();
   void preroll_push_(const uint8_t *data, size_t len);
-  void preroll_flush_();
+  void preroll_flush_(uint32_t epoch);
   void preroll_reset_();
 
   // ---- Uplink ring + sender task -----------------------------------------------------------
@@ -309,7 +351,7 @@ class VoiceAssistantWebSocket : public Component {
   // Capacity must comfortably exceed PREROLL_CAPACITY (48 KB), or a look-back flush could drop its
   // own oldest bytes - which are exactly the wake word and the front of the command the look-back
   // exists to rescue. 96 KB is ~2 s @ 24 kHz mono16 (the required minimum is ~500 ms).
-  static const size_t UPLINK_RING_CAPACITY = 96 * 1024;
+  static const size_t UPLINK_RING_CAPACITY = 192 * 1024;
   static const size_t UPLINK_SEND_CHUNK = INPUT_BUFFER_SIZE;   // 100 ms per websocket frame
   static const uint32_t UPLINK_SEND_TIMEOUT_MS = 200;          // bounded; never portMAX_DELAY
   static const uint32_t UPLINK_DROP_LOG_INTERVAL_MS = 5000;    // rate-limit the drop report
@@ -317,17 +359,18 @@ class VoiceAssistantWebSocket : public Component {
   uint8_t *uplink_stage_{nullptr};     // internal-RAM copy-out, so the send holds no lock at all
   size_t uplink_read_{0};
   size_t uplink_fill_{0};
+  uint32_t uplink_epoch_{0};  // guarded by uplink_lock_; tags queued PCM across session resets
   SemaphoreHandle_t uplink_lock_{nullptr};  // guards uplink_read_/uplink_fill_ only (tiny sections)
   SemaphoreHandle_t uplink_wake_{nullptr};  // "data available" / "please exit" signal
   TaskHandle_t uplink_task_{nullptr};
   volatile bool uplink_task_exit_{false};
   volatile bool uplink_task_running_{false};
-  volatile bool uplink_paused_{false};  // set while disconnect_websocket_() tears the client down
-  uint32_t uplink_dropped_bytes_{0};
-  uint32_t uplink_drop_events_{0};
+  std::atomic<bool> uplink_paused_{false};
+  std::atomic<uint32_t> uplink_dropped_bytes_{0};
+  std::atomic<uint32_t> uplink_drop_events_{0};
   uint32_t uplink_last_drop_log_{0};
   void uplink_init_();                                    // main task, from setup(); creates once
-  void uplink_enqueue_(const uint8_t *data, size_t len);  // mic task; never blocks
+  void uplink_enqueue_(const uint8_t *data, size_t len, uint32_t epoch);
   void uplink_reset_();                                   // drop a dead session's queued audio
   void uplink_shutdown_();                                // main task; asks the sender to exit
   void uplink_run_();                                     // sender task body
@@ -338,9 +381,10 @@ class VoiceAssistantWebSocket : public Component {
   // a stalled TCP write. The WEBSOCKET task must never take this lock at all - it would deadlock
   // against esp_websocket_client_close(), which joins that very task.
   SemaphoreHandle_t ws_client_lock_{nullptr};
-  // IDF close/stop/destroy can block for the network timeout. Never perform
-  // that wait on ESPHome's loop task; a worker owns the detached handle while
-  // loop() continues servicing the watchdog and the rest of the device.
+  // esp_websocket_client_stop()/close()/destroy() wait for the ESP-IDF websocket task to exit and
+  // can block for its full network timeout.  They must never run on ESPHome's loopTask: doing so
+  // starves the Arduino watchdog even though the CPU is otherwise idle.  Teardown is handed to a
+  // short-lived worker; loop() polls these flags and keeps servicing the rest of the device.
   esp_websocket_client_handle_t disconnect_client_{nullptr};
   std::atomic<bool> disconnect_task_active_{false};
   std::atomic<bool> disconnect_task_done_{false};
@@ -364,11 +408,7 @@ class VoiceAssistantWebSocket : public Component {
   
   bool pending_start_{false};
   bool pending_disconnect_{false};  // Flag to disconnect in loop() (cannot be called from websocket task)
-  bool pending_reboot_{false};  // Flag to reboot in loop() (server {"type":"reboot"} frame; cannot reboot from websocket task)
-  // Protected by deferred_lock_; consumed once on the main task after teardown.
-  std::string pending_dropin_room_;
-  std::string pending_dropin_request_id_;
-  uint32_t pending_dropin_deadline_ms_{0};
+  std::atomic<bool> pending_reboot_{false};  // Flag to reboot in loop() (server {"type":"reboot"} frame; cannot reboot from websocket task)
   bool reconnect_pending_{false};
   // Set alongside reconnect_pending_ when connect_websocket_() has to tear a stale client down
   // before it can honour a FRESH WAKE. It has to be a separate flag because both websocket event
@@ -386,15 +426,16 @@ class VoiceAssistantWebSocket : public Component {
 
   // Wake-boundary / server-driven chime->start delay. Overwritten by the {"type":"hello",
   // "wake_open_delay_ms":N} frame the server sends on WS open; falls back to this default
-  // (matches the YAML ${wake_open_delay_ms} substitution) if no hello arrives.
-  uint32_t wake_open_delay_ms_{320};
+  // (set per device via the `wake_open_delay_ms` component option; Satellite1 plays no wake chime
+  // so it stays 0, the Voice PE sets its chime delay) if no hello arrives.
+  std::atomic<uint32_t> wake_open_delay_ms_{0};
 
   // Mic-forward gate: drop uplink frames until this millis() timestamp. Set on every wake
   // (start() for a cold wake, interrupt() for a barge-in re-wake) to wake_open_delay_ms_ from now,
   // so the wake chime doesn't bleed into ASR — while the WS connect runs *underneath* it instead
   // of after it. Lets the mic open ~wake_open_delay_ms after wake regardless of connect latency,
   // instead of chime + delay + connect (which ate the front of the user's command). 0 = no gate.
-  uint32_t mic_gate_until_{0};
+  std::atomic<uint32_t> mic_gate_until_{0};
 
   // Enrollment mode: mic pinned open + streaming, wake/stop models disarmed by YAML.
   // Auto-restores on {"enroll","stop"}, WS drop, or the 15-min safety cap.
@@ -419,9 +460,9 @@ class VoiceAssistantWebSocket : public Component {
   std::string wt_fw_{"unknown"};
   uint8_t wt_window_{0};
   uint8_t enrollment_wake_channel_{1};
-  uint8_t enrollment_wake_gain_factor_{4};
-  bool enrolling_{false};
+  uint8_t enrollment_wake_gain_factor_{6};
   std::atomic<bool> enroll_wake_tap_{false};
+  std::atomic<bool> enrolling_{false};
   uint32_t enroll_start_time_{0};
   static const uint32_t ENROLL_MAX_MS = 15 * 60 * 1000;  // 15-min hard safety cap
 };

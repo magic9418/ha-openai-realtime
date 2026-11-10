@@ -68,6 +68,10 @@ substitutions:
   # Strict rejection remains active during playback and barge-in as well as idle.
   # Calibrated on saved clips; everyday PE recall/false-wake behavior needs observation.
   wake_word_model: wake_words/penny_v5_oct1.json
+  # NOTE (review 2026-11-10): these flat cutoffs (235/235) and window 5 DIFFER from the Satellite1's
+  # tiered 217/191/166/155 (satellite1 config/common/neo_voice.yaml). They were tuned on real
+  # devices and NOT verified as intentional vs. drift: do not "fix" them to match without a
+  # real-device A/B on this PE.
   wake_penny_cutoff_idle: "0.922"
   wake_penny_cutoff_idle_int: "235"
   wake_penny_cutoff_session_int: "235"
@@ -1361,6 +1365,13 @@ voice_assistant_websocket:
   # exactly what the model scored. Model name = basename of ${wake_word_model}.
   enrollment_wake_channel: 1
   enrollment_wake_gain_factor: 4
+  # PE-specific (the component source is shared byte-for-byte with Satellite1, see
+  # shared_components.lock.json; per-device differences live in these options):
+  # 1 KiB websocket buffer: a 4 KiB one cannot be allocated while Sendspin has I2S's DMA pool.
+  # Chunked frames are reassembled in the component, so this only means more chunks.
+  websocket_buffer_size: 1024
+  # The PE plays a wake chime; mic opens this long after wake until the server's `hello` overrides it.
+  wake_open_delay_ms: 320ms
   wake_trigger_model: ${wake_word_model}
   wake_trigger_window: ${wake_penny_window}
   wake_trigger_fw: ${esp32_fw_version}
