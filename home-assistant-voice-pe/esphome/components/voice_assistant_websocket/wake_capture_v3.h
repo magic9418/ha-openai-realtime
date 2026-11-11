@@ -45,6 +45,8 @@ struct WakeS2Meta {
   uint16_t infer_ms{0};
   char status[16]{"ok"};          // ok | selftest_fail | nomem | nopsram | nomodel | notconfigured
   char model[40]{"s2"};
+  // Why no feature upload (only set when features_follow is false): nodetector | nobuf | window | disabled.
+  char features_skip[12]{""};
 };
 
 inline const char *wf_mode_name(uint8_t m) { return m == 2 ? "enforce" : (m == 1 ? "shadow" : "off"); }
@@ -80,6 +82,7 @@ inline size_t wf_build_trigger_start(char *buf, size_t cap, bool bargein, bool c
   }
   if (capture_only && !app("%s", ",\"capture_only\":true")) return 0;
   if (s2.follow_features && !app("%s", ",\"features_follow\":true")) return 0;
+  if (!s2.follow_features && s2.features_skip[0] != '\0' && !app(",\"features_skip\":\"%s\"", s2.features_skip)) return 0;
   if (len + 2 > cap) return 0;
   buf[len++] = '}';
   buf[len] = '\0';

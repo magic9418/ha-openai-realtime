@@ -54,6 +54,22 @@ int main(int argc, char **argv) {
   // stale: fire frame too old (>250 back)
   for (uint32_t n = 620; n < 900; n++) h.push(f, 0, 0);
   CHECK(!h.copy_upload(599, 3, 50, up.data(), &fw));
+  // ---- timing robustness: more/fewer post frames than the ring allows must never fail the window ----
+  {
+    FeatureHistory h2; static uint8_t mem2[FeatureHistory::BYTES]; CHECK(h2.attach(mem2));
+    auto pushn = [&](uint32_t from, uint32_t to) { for (uint32_t n = from; n < to; n++) { memset(f, int(n & 0x7f) - 64, 40); h2.push(f, uint8_t(n), 0); } };
+    const uint32_t fire = 599;
+    pushn(0, fire + 1 + 49);   // only 49 post frames exist: take 49, report the real count
+    CHECK(h2.copy_upload(fire, 3, 50, up.data(), &fw) && fw.post_frames == 49 && fw.pre_frames == 198 && fw.frames == 247 && fw.fire_idx == 197);
+    pushn(fire + 1 + 49, fire + 1 + 60);  // 60 post frames exist: ring advanced, PRE shortened, 50 post kept
+    CHECK(h2.copy_upload(fire, 3, 50, up.data(), &fw));
+    CHECK(fw.post_frames == 50 && fw.pre_frames % 3 == 0 && fw.pre_frames < 198 && fw.pre_frames >= 100 && fw.fire_idx == fw.pre_frames - 1);
+    CHECK(fw.frames == fw.pre_frames + fw.post_frames && fw.frames <= 250);
+    CHECK(up[fw.fire_idx * 40] == int((fire & 0x7f)) - 64);  // the fire frame sits where fire_idx says
+    CHECK(up[0] == int(((fire + 1 - fw.pre_frames) & 0x7f)) - 64);
+    pushn(fire + 1 + 60, fire + 1 + 3 * 50);  // far too late: no window
+    CHECK(!h2.copy_upload(fire, 3, 50, up.data(), &fw));
+  }
   printf(fails ? "FAILED\n" : "ok\n");
   return fails ? 1 : 0;
 }

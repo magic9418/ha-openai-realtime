@@ -89,6 +89,8 @@ class MicroWakeWord : public Component
   uint8_t get_stage2_threshold() const { return this->stage2_.threshold(); }
   const char *get_stage2_status() const { return this->stage2_.status(); }
   const char *get_stage2_mode_name() const { return Stage2Runner::mode_name(this->stage2_.mode()); }
+  bool feature_history_ready() const { return this->history_.attached(); }
+  void note_feature_upload(bool sent) { this->stage2_.note_feature_upload(sent); }
   const std::string &get_stage2_model_id() const { return this->stage2_.model_id(); }
   /// Stage-2 result of the detection being dispatched (valid inside on_wake_word_detected / _rejected).
   const Stage2Result &get_last_stage2() const { return this->last_stage2_; }

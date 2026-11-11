@@ -1317,6 +1317,11 @@ void VoiceAssistantWebSocket::wake_trigger_loop_() {
     this->wt_feat_ok_ = this->wt_s2_.follow_features && this->detector_ != nullptr && this->wt_feat_ != nullptr &&
                         this->detector_->copy_feature_upload(this->wt_fire_frame_, 50, this->wt_feat_, &this->wt_fwin_);
     this->wt_s2_.follow_features = this->wt_feat_ok_;
+    if (!this->wt_feat_ok_) {
+      this->set_features_skip_(this->wt_s2_, this->wt_fire_frame_);  // reason goes into the start frame
+      if (this->detector_ != nullptr) this->detector_->note_feature_upload(false);
+      ESP_LOGW(TAG, "Wake trigger: no feature window (%s)", this->wt_s2_.features_skip);
+    }
     this->wt_state_.store(WT_WAIT_MARKER);
     return;
   }
@@ -1374,6 +1379,7 @@ void VoiceAssistantWebSocket::wake_trigger_loop_() {
   }
   if (this->wt_seq_ + 1 >= total_frames) {
     ESP_LOGI(TAG, "Wake trigger upload complete (%u chunks%s)", (unsigned) chunks, feats ? " + features" : "");
+    if (feats && this->detector_ != nullptr) this->detector_->note_feature_upload(true);
     this->wt_state_.store(WT_NONE);
     return;
   }

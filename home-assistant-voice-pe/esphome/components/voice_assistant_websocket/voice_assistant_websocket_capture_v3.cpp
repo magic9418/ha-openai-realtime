@@ -87,6 +87,17 @@ void VoiceAssistantWebSocket::capture_s2_meta_(WakeS2Meta &m, uint32_t &fire_fra
     m.threshold = this->detector_->get_stage2_threshold();
   }
   m.follow_features = this->co_enabled_ && fire_frame != 0xFFFFFFFFu;
+  if (!m.follow_features) this->set_features_skip_(m, fire_frame);
+}
+
+// Short machine-readable reason a feature upload cannot happen (diagnosable from the sidecar next time).
+void VoiceAssistantWebSocket::set_features_skip_(WakeS2Meta &m, uint32_t fire_frame) {
+  const char *why = "window";
+  if (this->detector_ == nullptr) why = "nodetector";
+  else if (!this->co_enabled_ || this->wt_feat_ == nullptr) why = "nobuf";
+  else if (!this->detector_->feature_history_ready()) why = "disabled";
+  snprintf(m.features_skip, sizeof(m.features_skip), "%s", why);
+  (void) fire_frame;
 }
 
 // YAML on_wake_word_rejected -> here. Main loop only.
@@ -266,6 +277,8 @@ void VoiceAssistantWebSocket::co_loop_() {
     j.feat_ok = j.s2.follow_features && this->detector_ != nullptr &&
                 this->detector_->copy_feature_upload(j.fire_frame, 50, this->co_feat_[i], &j.fw);
     j.s2.follow_features = j.feat_ok;
+    if (!j.feat_ok) this->set_features_skip_(j.s2, j.fire_frame);
+    if (!j.feat_ok && this->detector_ != nullptr) this->detector_->note_feature_upload(false);
     j.phase = 2;
   }
 
@@ -350,6 +363,7 @@ void VoiceAssistantWebSocket::co_loop_() {
       this->co_seq_++;
       this->co_next_ms_ = now + WT_PACE_MS;  // same pacing as the normal upload
       if (this->co_seq_ >= total) {
+        if (j.feat_ok && this->detector_ != nullptr) this->detector_->note_feature_upload(true);
         if (this->co_old_server_) {  // old server: no capture_ack ever; close ourselves right after the last frame
           ESP_LOGI(TAG, "Capture-only upload sent (old server, closing)");
           this->co_n_acked_++;

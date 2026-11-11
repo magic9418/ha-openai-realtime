@@ -23,6 +23,7 @@ constexpr size_t FEATURE_UPLOAD_MAX_FRAMES = FEATURE_HISTORY_FRAMES;
 constexpr size_t FEATURE_UPLOAD_PRE_FRAMES = 198;  // fire frame + 197 before it (multiple of the stride 3)
 constexpr size_t FEATURE_UPLOAD_MAX_PROBS = FEATURE_HISTORY_FRAMES / 3 + 1;  // 84
 constexpr size_t STAGE2_WINDOW_FRAMES = 100;     // model input: 1.0 s
+constexpr size_t FEATURE_COPY_MARGIN = 3;        // newest-overwrite safety margin when copying a window
 
 enum Stage2Mode : uint8_t { STAGE2_OFF = 0, STAGE2_SHADOW = 1, STAGE2_ENFORCE = 2 };
 
@@ -101,9 +102,19 @@ class FeatureHistory {
     if (feats_ == nullptr || stride == 0 || stride > 8) return false;
     const uint32_t written = frames_written();
     if (written == 0 || written <= fire) return false;
+    // The ring holds only the newest 250 frames. The caller freezes the window ~500 ms after the fire frame, so
+    // 50+ post frames normally exist already, and 198 pre + 53 post would overwrite the oldest wanted frame.
+    // Never fail on timing: take what exists (post <= want_post) and, if the ring has advanced, shorten the PRE part
+    // (in whole strides, so the window still starts at an invocation boundary). Frames within MARGIN of the
+    // overwrite point are not trusted (the producer may be writing them right now).
+    const uint32_t oldest_ok = written > FEATURE_HISTORY_FRAMES - FEATURE_COPY_MARGIN
+                                   ? written - uint32_t(FEATURE_HISTORY_FRAMES - FEATURE_COPY_MARGIN)
+                                   : 0;
+    if (fire + 1 <= oldest_ok) return false;
     size_t pre = (FEATURE_UPLOAD_PRE_FRAMES / stride) * stride;
-    while (pre > fire + 1) pre -= stride;  // not enough history yet
-    if (pre < stride) return false;
+    const size_t pre_fit = ((size_t(fire) + 1 - oldest_ok) / stride) * stride;  // pre frames still intact
+    pre = std::min(pre, pre_fit);
+    if (pre < STAGE2_WINDOW_FRAMES) return false;  // window no longer holds the 1 s stage 2 scored
     const size_t avail_post = written - 1 - fire;
     size_t post = std::min(want_post, avail_post);
     post = std::min(post, FEATURE_UPLOAD_MAX_FRAMES - pre);

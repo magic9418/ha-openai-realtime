@@ -229,13 +229,14 @@ void Stage2Runner::log_summary_(const char *prefix, uint32_t frames_total, uint3
   ESP_LOGI(TAG,
            "%s mode=%s thr=%u status=%s selftest=%s arena=%u/%u B(PSRAM) setup_free_psram=%u setup_free_int=%u "
            "frames=%u stage1_infers=%u det=%u pass=%u rej=%u shadow_would_reject=%u skipped=%u err=%u last_ms=%u "
-           "last_score=%u",
+           "last_score=%u feat_sent=%u feat_skipped=%u",
            prefix, mode_name(this->mode()), (unsigned) this->threshold(), this->status_, this->selftest_text_,
            (unsigned) this->arena_used_, (unsigned) this->arena_actual_, (unsigned) this->setup_free_psram_,
            (unsigned) this->setup_free_internal_, (unsigned) frames_total, (unsigned) infers_total,
            (unsigned) this->n_detections_.load(), (unsigned) this->n_passed_.load(), (unsigned) this->n_rejected_.load(),
            (unsigned) this->n_shadow_reject_.load(), (unsigned) this->n_skipped_.load(),
-           (unsigned) this->n_errors_.load(), (unsigned) this->last_infer_ms_.load(), (unsigned) this->last_score_.load());
+           (unsigned) this->n_errors_.load(), (unsigned) this->last_infer_ms_.load(), (unsigned) this->last_score_.load(),
+           (unsigned) this->n_feat_sent_.load(), (unsigned) this->n_feat_skipped_.load());
 }
 
 void Stage2Runner::loop(uint32_t frames_total, uint32_t infers_total) {

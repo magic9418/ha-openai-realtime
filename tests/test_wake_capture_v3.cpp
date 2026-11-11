@@ -1,6 +1,7 @@
 // Host test: g++ -std=c++17 -I. -Iesphome/components tests/test_wake_capture_v3.cpp -o /tmp/t3 && /tmp/t3 > /tmp/t3.out
 // Prints frames as JSON lines; tests/check_wake_capture_v3.py validates them with Python (zlib CRC, base64, JSON).
 #include <cstdio>
+#include <cstring>
 #include <vector>
 #include "voice_assistant_websocket/wake_capture_v3.h"
 using namespace esphome::voice_assistant_websocket;
@@ -22,6 +23,9 @@ int main() {
   s2.present = false; s2.follow_features = false;
   n = wf_build_trigger_start(buf.data(), buf.size(), true, false, 16000, 40000, 20, 1, 6, 235, 5, "session", "m", "f", 500, 2000, -1, -1, s2);
   CHECK(n > 0); printf("%s\n", buf.data());
+  s2.present = true; s2.follow_features = false; snprintf(s2.features_skip, sizeof s2.features_skip, "window");
+  n = wf_build_trigger_start(buf.data(), buf.size(), false, false, 16000, 40000, 20, 1, 6, 235, 5, "idle", "m", "f", 500, 2000, 1, 1, s2);
+  CHECK(n > 0 && strstr(buf.data(), "\"features_skip\":\"window\"") && !strstr(buf.data(), "features_follow"));
   const size_t frames = wf_feature_frame_count(w);
   CHECK(frames == 10 + 2);  // 9920 B -> 10 chunks
   size_t maxlen = 0;

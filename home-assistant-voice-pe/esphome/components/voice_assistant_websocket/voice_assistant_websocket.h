@@ -481,6 +481,7 @@ class VoiceAssistantWebSocket : public Component {
   micro_wake_word::MicroWakeWord *detector_{nullptr};
   void capture_v3_init_();
   void capture_s2_meta_(WakeS2Meta &m, uint32_t &fire_frame);
+  void set_features_skip_(WakeS2Meta &m, uint32_t fire_frame);
   void apply_wake_stage2_(uint8_t mode, uint8_t threshold);
   void co_loop_();
   void co_preempt_();

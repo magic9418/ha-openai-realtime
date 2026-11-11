@@ -43,6 +43,8 @@ class Stage2Runner {
   // Thread-safe runtime control (server hello / YAML). threshold 0 = "use the compiled default".
   void set_mode(uint8_t mode);
   void set_threshold(uint8_t threshold);
+  /// capture-v3 feature upload bookkeeping (counted by voice_assistant_websocket).
+  void note_feature_upload(bool sent) { (sent ? this->n_feat_sent_ : this->n_feat_skipped_).fetch_add(1); }
   void set_cold_idle(bool cold_idle) { this->cold_idle_.store(cold_idle, std::memory_order_relaxed); }
 
   /// Effective mode: "off" whenever stage 2 is not usable, whatever was requested.
@@ -84,6 +86,7 @@ class Stage2Runner {
   // Counters: written by the inference task, read by the main loop (relaxed is enough for diagnostics).
   std::atomic<uint32_t> n_detections_{0}, n_passed_{0}, n_rejected_{0}, n_shadow_reject_{0}, n_skipped_{0},
       n_errors_{0};
+  std::atomic<uint32_t> n_feat_sent_{0}, n_feat_skipped_{0};
   std::atomic<uint32_t> last_infer_ms_{0};
   std::atomic<uint32_t> last_score_{0};
   size_t arena_used_{0};
