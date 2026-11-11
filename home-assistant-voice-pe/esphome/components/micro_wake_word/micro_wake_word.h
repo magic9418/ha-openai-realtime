@@ -164,6 +164,7 @@ class MicroWakeWord : public Component
 
   /// NEO: record one feature frame + the stage-1/VAD probabilities held as of it (inference task, no allocation).
   void record_feature_frame_(const int8_t *features);
+  uint32_t total_stage1_invokes_() const;
 
   /// @brief Generates a spectrogram feature from an input buffer of audio samples. The frontend buffers samples
   /// internally, so callers may stream arbitrary-sized chunks; a feature is only emitted once enough samples have

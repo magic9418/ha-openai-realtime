@@ -221,6 +221,7 @@ bool StreamingModel::perform_streaming_inference(const int8_t features[PREPROCES
       }
 
       TfLiteTensor *output = this->interpreter_->output(0);
+      this->total_invokes_.fetch_add(1, std::memory_order_relaxed);
 
       ++this->last_n_index_;
       if (this->last_n_index_ == this->sliding_window_size_)

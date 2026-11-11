@@ -68,6 +68,8 @@ class FeatureHistory {
   bool attached() const { return feats_ != nullptr; }
   void reset() { written_.store(0, std::memory_order_release); }
   uint32_t frames_written() const { return written_.load(std::memory_order_acquire); }
+  /// Frames ever pushed (never reset): a liveness counter that proves the detector is consuming audio.
+  uint32_t total_pushed() const { return total_.load(std::memory_order_relaxed); }
 
   // PRODUCER. `prob`/`vad` = latest stage-1 / VAD outputs as of this frame (held between invocations).
   void push(const int8_t *frame, uint8_t prob, uint8_t vad) {
@@ -78,6 +80,7 @@ class FeatureHistory {
     prob_[i] = prob;
     vad_[i] = vad;
     written_.store(w + 1, std::memory_order_release);
+    total_.fetch_add(1, std::memory_order_relaxed);
   }
 
   // Copy the n frames ending at absolute frame `end_frame` (inclusive), oldest first, to dst[n*40].
@@ -129,6 +132,7 @@ class FeatureHistory {
   uint8_t *prob_{nullptr};
   uint8_t *vad_{nullptr};
   std::atomic<uint32_t> written_{0};
+  std::atomic<uint32_t> total_{0};
 };
 
 }  // namespace esphome::micro_wake_word

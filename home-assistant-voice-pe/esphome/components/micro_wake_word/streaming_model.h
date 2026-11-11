@@ -57,6 +57,7 @@ class StreamingModel {
   // NEO stage 2: output of the most recent invocation (0-255), and the model's invocation stride (frames).
   uint8_t latest_probability() const { return this->recent_streaming_probabilities_[this->last_n_index_]; }
   uint8_t get_stride() const { return this->stride_; }
+  uint32_t total_invokes() const { return this->total_invokes_.load(std::memory_order_relaxed); }
 
   // Quantized probability cutoffs mapping 0.0 - 1.0 to 0 - 255
   uint8_t get_default_probability_cutoff() const { return this->default_probability_cutoff_; }
@@ -82,6 +83,7 @@ class StreamingModel {
   bool unprocessed_probability_status_{false};
   uint8_t current_stride_step_{0};
   uint8_t stride_{0};
+  std::atomic<uint32_t> total_invokes_{0};  // NEO liveness counter: stage-1 invocations ever run
   int16_t ignore_windows_{-MIN_SLICES_BEFORE_DETECTION};
 
   uint8_t default_probability_cutoff_;

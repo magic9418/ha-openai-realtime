@@ -362,8 +362,8 @@ STAGE2_SCHEMA = cv.Schema(
             "off", "shadow", "enforce", lower=True
         ),
         cv.Optional(CONF_DEFAULT_THRESHOLD, default=0): cv.int_range(min=0, max=255),
-        cv.Optional(CONF_TENSOR_ARENA_SIZE, default=40000): cv.int_range(
-            min=16384, max=262144
+        cv.Optional(CONF_TENSOR_ARENA_SIZE, default=131072): cv.int_range(
+            min=16384, max=524288
         ),
         cv.GenerateID(CONF_RAW_DATA_ID): cv.declare_id(cg.uint8),
     }

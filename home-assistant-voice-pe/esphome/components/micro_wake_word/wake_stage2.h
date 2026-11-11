@@ -34,8 +34,8 @@ class Stage2Runner {
   /// Main task, from MicroWakeWord::setup(): allocate (PSRAM), AllocateTensors, boot self-test, load prefs.
   void setup(FeatureHistory *history);
   /// Main task, every loop: persists a server-pushed mode/threshold, prints the once-a-minute counters line.
-  void loop();
-  void dump_config();
+  void loop(uint32_t frames_total, uint32_t infers_total);
+  void dump_config(uint32_t frames_total, uint32_t infers_total);
 
   /// Inference task only. Scores the window ending at `fire_frame`.
   Stage2Result evaluate(uint32_t fire_frame);
@@ -53,12 +53,16 @@ class Stage2Runner {
     return t == 0 ? this->default_threshold_ : t;
   }
   bool ready() const { return this->ready_; }
-  const char *status() const { return this->status_; }  // ok | selftest_fail | nomem | nomodel | nopsram | notconfigured
+  // ok | nohist | nopsram | alloc_tensors | nomodel | selftest_fail | notconfigured
+  const char *status() const { return this->status_; }
   const std::string &model_id() const { return this->model_id_; }
   static const char *mode_name(uint8_t mode);
 
  protected:
   bool selftest_();
+  bool build_interpreter_(size_t arena_size);  // alloc arena + interpreter + AllocateTensors; frees on failure
+  void release_();
+  void log_summary_(const char *prefix, uint32_t frames_total, uint32_t infers_total);
   tflite::MicroMutableOpResolver<5> resolver_;
   std::unique_ptr<tflite::MicroInterpreter> interpreter_;
   FeatureHistory *history_{nullptr};
@@ -83,6 +87,9 @@ class Stage2Runner {
   std::atomic<uint32_t> last_infer_ms_{0};
   std::atomic<uint32_t> last_score_{0};
   size_t arena_used_{0};
+  size_t arena_actual_{0};      // arena size actually in use (after an optional 2x retry)
+  char selftest_text_[40]{"n/a"};
+  uint32_t setup_free_psram_{0}, setup_free_internal_{0};
   uint32_t last_log_ms_{0};
 };
 

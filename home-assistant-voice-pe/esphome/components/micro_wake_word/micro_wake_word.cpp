@@ -72,7 +72,7 @@ static const LogString *micro_wake_word_state_to_string(State state) {
 
 void MicroWakeWord::dump_config() {
   ESP_LOGCONFIG(TAG, "microWakeWord:");
-  this->stage2_.dump_config();
+  this->stage2_.dump_config(this->history_.total_pushed(), this->total_stage1_invokes_());
   ESP_LOGCONFIG(TAG, "  models:");
   for (auto &model : this->wake_word_models_) {
     model->log_model_config();
@@ -273,7 +273,7 @@ void MicroWakeWord::resume_task_() {
 }
 
 void MicroWakeWord::loop() {
-  this->stage2_.loop();
+  this->stage2_.loop(this->history_.total_pushed(), this->total_stage1_invokes_());
 
   uint32_t event_group_bits = xEventGroupGetBits(this->event_group_);
 
@@ -429,6 +429,10 @@ void MicroWakeWord::set_state_(State state) {
              LOG_STR_ARG(micro_wake_word_state_to_string(state)));
     this->state_ = state;
   }
+}
+
+uint32_t MicroWakeWord::total_stage1_invokes_() const {
+  return this->wake_word_models_.empty() ? 0u : this->wake_word_models_[0]->total_invokes();
 }
 
 void MicroWakeWord::record_feature_frame_(const int8_t *features) {

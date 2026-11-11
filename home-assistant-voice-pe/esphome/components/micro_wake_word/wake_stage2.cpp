@@ -9,6 +9,9 @@
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 
+#include <algorithm>
+#include <cstring>
+
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -30,6 +33,8 @@ static const uint8_t PREF_MAGIC = 0xA5;
 // an overflow of the 4 KB inference task stack.
 static const UBaseType_t MIN_STACK_HEADROOM_WORDS = 384;  // 1536 B
 static const uint32_t COUNTERS_LOG_INTERVAL_MS = 60000;
+// LiteRT reference gives -71 for vector 2, TFLM reference kernels -69: +-3 keeps both (and ESP-NN rounding) passing.
+static const int SELFTEST_TOLERANCE = 3;
 
 const char *Stage2Runner::mode_name(uint8_t mode) {
   switch (mode) {
@@ -51,6 +56,31 @@ void Stage2Runner::set_threshold(uint8_t threshold) {
   if (this->threshold_.exchange(threshold) != threshold) this->pref_dirty_.store(true);
 }
 
+bool Stage2Runner::build_interpreter_(size_t arena_size) {
+  this->release_();
+  this->arena_ = static_cast<uint8_t *>(heap_caps_aligned_alloc(16, arena_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (this->arena_ == nullptr) {
+    this->status_ = "nopsram";
+    return false;
+  }
+  this->arena_actual_ = arena_size;
+  const tflite::Model *model = tflite::GetModel(this->model_data_);
+  this->interpreter_ = std::unique_ptr<tflite::MicroInterpreter>(
+      new (std::nothrow) tflite::MicroInterpreter(model, this->resolver_, this->arena_, arena_size));
+  if (this->interpreter_ == nullptr || this->interpreter_->AllocateTensors() != kTfLiteOk) {
+    this->status_ = "alloc_tensors";
+    return false;
+  }
+  return true;
+}
+
+void Stage2Runner::release_() {
+  this->interpreter_.reset();
+  if (this->arena_ != nullptr) heap_caps_free(this->arena_);
+  this->arena_ = nullptr;
+  this->arena_actual_ = 0;
+}
+
 void Stage2Runner::setup(FeatureHistory *history) {
   this->history_ = history;
   this->ready_ = false;
@@ -58,8 +88,12 @@ void Stage2Runner::setup(FeatureHistory *history) {
     this->status_ = "notconfigured";
     return;
   }
+  this->setup_free_psram_ = (uint32_t) heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  this->setup_free_internal_ = (uint32_t) heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
   this->mode_.store(this->default_mode_);
   this->threshold_.store(0);
+  // Preferences are initialised before any component's setup() (App.setup), and mww's setup priority
+  // (AFTER_CONNECTION) is later than PSRAM/preferences init, so both are safe to use here.
   this->pref_ = global_preferences->make_preference<Stage2Pref>(fnv1_hash("neo_mww_stage2_v1"));
   Stage2Pref p{};
   if (this->pref_.load(&p) && p.magic == PREF_MAGIC && p.mode <= STAGE2_ENFORCE) {
@@ -68,38 +102,36 @@ void Stage2Runner::setup(FeatureHistory *history) {
   }
 
   if (history == nullptr || !history->attached()) {
-    this->status_ = "nomem";
-    ESP_LOGE(TAG, "stage2 disabled: feature history not allocated");
+    this->status_ = "nohist";
+    ESP_LOGE(TAG, "stage2 disabled (nohist): feature history not allocated");
     return;
   }
-  // Arena: PSRAM only (explicit). Internal RAM is scarce (Voice PE) and the arena is ~40 KB.
-  this->arena_ = static_cast<uint8_t *>(heap_caps_aligned_alloc(16, this->arena_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (this->arena_ == nullptr) {
-    this->status_ = "nopsram";
-    ESP_LOGE(TAG, "stage2 DISABLED (mode off, detections pass): could not allocate %u B tensor arena in PSRAM",
-             (unsigned) this->arena_size_);
-    return;
-  }
-
   const tflite::Model *model = tflite::GetModel(this->model_data_);
-  if (model->version() != TFLITE_SCHEMA_VERSION) {
+  if (model == nullptr || model->version() != TFLITE_SCHEMA_VERSION) {
     this->status_ = "nomodel";
-    ESP_LOGE(TAG, "stage2 DISABLED: model schema version %u unsupported", (unsigned) model->version());
+    ESP_LOGE(TAG, "stage2 disabled (nomodel): schema version unsupported");
     return;
   }
   if (this->resolver_.AddConv2D() != kTfLiteOk || this->resolver_.AddDepthwiseConv2D() != kTfLiteOk ||
       this->resolver_.AddMaxPool2D() != kTfLiteOk || this->resolver_.AddFullyConnected() != kTfLiteOk ||
       this->resolver_.AddLogistic() != kTfLiteOk) {
     this->status_ = "nomodel";
-    ESP_LOGE(TAG, "stage2 DISABLED: op registration failed");
+    ESP_LOGE(TAG, "stage2 disabled (nomodel): op registration failed");
     return;
   }
-  this->interpreter_ = std::unique_ptr<tflite::MicroInterpreter>(
-      new (std::nothrow) tflite::MicroInterpreter(model, this->resolver_, this->arena_, this->arena_size_));
-  if (this->interpreter_ == nullptr || this->interpreter_->AllocateTensors() != kTfLiteOk) {
-    this->status_ = "nomem";
-    ESP_LOGE(TAG, "stage2 DISABLED: AllocateTensors failed with a %u B arena", (unsigned) this->arena_size_);
-    this->interpreter_.reset();
+  // Arena: PSRAM only. The model's own planner need is ~25 KB (measured with TFLM on the host); ESP-NN scratch
+  // and per-op persistent data come on top, so the default is generous and one 2x retry (cap 512 KB) follows.
+  static const size_t ARENA_CAP = 524288;
+  bool built = this->build_interpreter_(this->arena_size_);
+  if (!built && std::strcmp(this->status_, "alloc_tensors") == 0 && this->arena_size_ < ARENA_CAP) {
+    const size_t retry = std::min(this->arena_size_ * 2, ARENA_CAP);
+    ESP_LOGW(TAG, "stage2: AllocateTensors failed with %u B; retrying with %u B", (unsigned) this->arena_size_,
+             (unsigned) retry);
+    built = this->build_interpreter_(retry);
+  }
+  if (!built) {
+    ESP_LOGE(TAG, "stage2 DISABLED (%s): arena %u B PSRAM", this->status_, (unsigned) this->arena_size_);
+    this->release_();
     return;
   }
   TfLiteTensor *in = this->interpreter_->input(0);
@@ -107,8 +139,8 @@ void Stage2Runner::setup(FeatureHistory *history) {
   if (in == nullptr || out == nullptr || in->type != kTfLiteInt8 || out->type != kTfLiteInt8 || in->dims->size != 4 ||
       in->dims->data[1] != (int) STAGE2_WINDOW_FRAMES || in->dims->data[2] != (int) FEATURE_CHANNELS) {
     this->status_ = "nomodel";
-    ESP_LOGE(TAG, "stage2 DISABLED: unexpected model input/output tensors");
-    this->interpreter_.reset();
+    ESP_LOGE(TAG, "stage2 DISABLED (nomodel): unexpected model input/output tensors");
+    this->release_();
     return;
   }
   this->arena_used_ = this->interpreter_->arena_used_bytes();
@@ -118,7 +150,7 @@ void Stage2Runner::setup(FeatureHistory *history) {
   this->status_ = ok ? "ok" : "selftest_fail";
   ESP_LOGI(TAG, "stage2 %s: model=%s arena used %u of %u B (PSRAM) mode=%s threshold=%u (default %u)",
            ok ? "ready" : "FORCED OFF", this->model_id_.c_str(), (unsigned) this->arena_used_,
-           (unsigned) this->arena_size_, mode_name(this->mode()), (unsigned) this->threshold(),
+           (unsigned) this->arena_actual_, mode_name(this->mode()), (unsigned) this->threshold(),
            (unsigned) this->default_threshold_);
 }
 
@@ -135,11 +167,13 @@ bool Stage2Runner::selftest_() {
     }
     got[k] = this->interpreter_->output(0)->data.int8[0];
     const int d = got[k] - STAGE2_SELFTEST_EXPECTED[k];
-    if (d < -2 || d > 2) ok = false;
+    if (d < -SELFTEST_TOLERANCE || d > SELFTEST_TOLERANCE) ok = false;
   }
-  ESP_LOGI(TAG, "stage2 selftest: got %d,%d,%d expected %d,%d,%d (%s, tolerance +-2)", got[0], got[1], got[2],
+  snprintf(this->selftest_text_, sizeof(this->selftest_text_), "%s got %d,%d,%d", ok ? "PASS" : "FAIL", got[0], got[1],
+           got[2]);
+  ESP_LOGI(TAG, "stage2 selftest: got %d,%d,%d expected %d,%d,%d (%s, tolerance +-%d)", got[0], got[1], got[2],
            (int) STAGE2_SELFTEST_EXPECTED[0], (int) STAGE2_SELFTEST_EXPECTED[1], (int) STAGE2_SELFTEST_EXPECTED[2],
-           ok ? "PASS" : "FAIL");
+           ok ? "PASS" : "FAIL", SELFTEST_TOLERANCE);
   return ok;
 }
 
@@ -183,7 +217,21 @@ Stage2Result Stage2Runner::evaluate(uint32_t fire_frame) {
   return r;
 }
 
-void Stage2Runner::loop() {
+void Stage2Runner::log_summary_(const char *prefix, uint32_t frames_total, uint32_t infers_total) {
+  // Everything needed to diagnose remotely (setup-time lines are not visible over the network logger).
+  ESP_LOGI(TAG,
+           "%s mode=%s thr=%u status=%s selftest=%s arena=%u/%u B(PSRAM) setup_free_psram=%u setup_free_int=%u "
+           "frames=%u stage1_infers=%u det=%u pass=%u rej=%u shadow_would_reject=%u skipped=%u err=%u last_ms=%u "
+           "last_score=%u",
+           prefix, mode_name(this->mode()), (unsigned) this->threshold(), this->status_, this->selftest_text_,
+           (unsigned) this->arena_used_, (unsigned) this->arena_actual_, (unsigned) this->setup_free_psram_,
+           (unsigned) this->setup_free_internal_, (unsigned) frames_total, (unsigned) infers_total,
+           (unsigned) this->n_detections_.load(), (unsigned) this->n_passed_.load(), (unsigned) this->n_rejected_.load(),
+           (unsigned) this->n_shadow_reject_.load(), (unsigned) this->n_skipped_.load(),
+           (unsigned) this->n_errors_.load(), (unsigned) this->last_infer_ms_.load(), (unsigned) this->last_score_.load());
+}
+
+void Stage2Runner::loop(uint32_t frames_total, uint32_t infers_total) {
   if (!this->configured_) return;
   if (this->pref_dirty_.exchange(false)) {
     Stage2Pref p{PREF_MAGIC, this->mode_.load(), this->threshold_.load(), 0};
@@ -194,22 +242,19 @@ void Stage2Runner::loop() {
   const uint32_t now = millis();
   if (now - this->last_log_ms_ >= COUNTERS_LOG_INTERVAL_MS) {
     this->last_log_ms_ = now;
-    ESP_LOGI(TAG,
-             "[stage2] mode=%s thr=%u status=%s det=%u pass=%u rej=%u shadow_would_reject=%u skipped=%u err=%u "
-             "last_ms=%u last_score=%u arena=%u/%u",
-             mode_name(this->mode()), (unsigned) this->threshold(), this->status_, (unsigned) this->n_detections_.load(),
-             (unsigned) this->n_passed_.load(), (unsigned) this->n_rejected_.load(),
-             (unsigned) this->n_shadow_reject_.load(), (unsigned) this->n_skipped_.load(),
-             (unsigned) this->n_errors_.load(), (unsigned) this->last_infer_ms_.load(),
-             (unsigned) this->last_score_.load(), (unsigned) this->arena_used_, (unsigned) this->arena_size_);
+    this->log_summary_("[stage2]", frames_total, infers_total);
   }
 }
 
-void Stage2Runner::dump_config() {
-  ESP_LOGCONFIG(TAG,
-                "  Stage 2: model=%s status=%s mode=%s threshold=%u (default %u) arena=%u B PSRAM, feature history %u B",
+void Stage2Runner::dump_config(uint32_t frames_total, uint32_t infers_total) {
+  if (!this->configured_) return;
+  ESP_LOGCONFIG(TAG, "  Stage 2: model=%s status=%s mode=%s threshold=%u (default %u) arena=%u/%u B PSRAM selftest=%s",
                 this->model_id_.c_str(), this->status_, mode_name(this->mode()), (unsigned) this->threshold(),
-                (unsigned) this->default_threshold_, (unsigned) this->arena_size_, (unsigned) FeatureHistory::BYTES);
+                (unsigned) this->default_threshold_, (unsigned) this->arena_used_, (unsigned) this->arena_actual_,
+                this->selftest_text_);
+  ESP_LOGCONFIG(TAG, "  Stage 2 setup: free PSRAM %u B, free internal %u B; feature history %u B; frames=%u stage1_infers=%u",
+                (unsigned) this->setup_free_psram_, (unsigned) this->setup_free_internal_,
+                (unsigned) FeatureHistory::BYTES, (unsigned) frames_total, (unsigned) infers_total);
 }
 
 }  // namespace esphome::micro_wake_word
