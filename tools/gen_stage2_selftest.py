@@ -3,8 +3,8 @@
 
 The firmware (esphome/components/micro_wake_word/wake_stage2_selftest.h) builds three synthetic int8
 inputs [1,100,40,1] in code: constant -128, a sawtooth ((i%32)*8-128) and a fixed LCG pattern ((top byte>>2)-90). This script builds
-the same vectors, runs the .tflite with the reference LiteRT interpreter and writes the expected int8
-outputs to esphome/components/micro_wake_word/wake_stage2_expected.h. The device accepts +-2.
+the same vectors, runs the .tflite with the TFLM reference interpreter (LiteRT fallback) and writes the expected int8
+outputs to esphome/components/micro_wake_word/wake_stage2_expected.h. The device accepts +-12 (ESP-NN differs from the reference by a few LSB) and rejects an all-identical output triple.
 
   python tools/gen_stage2_selftest.py [--model wake_words/penny_stage2_v1.tflite] [--write] [--check]
 
@@ -41,6 +41,19 @@ def fnv1a(a: np.ndarray) -> int:
     return h
 
 
+class _TflmAdapter:
+    """TFLM reference kernels (the same runtime family as the firmware) behind a LiteRT-like surface."""
+
+    def __init__(self, model):
+        from tflite_micro.python.tflite_micro import runtime
+        self.it = runtime.Interpreter.from_file(model, arena_size=65536)
+
+    def predict(self, v):
+        self.it.set_input(v.reshape(1, 100, 40, 1), 0)
+        self.it.invoke()
+        return int(self.it.get_output(0).flatten()[0])
+
+
 def interpreter(model: str):
     try:
         from ai_edge_litert.interpreter import Interpreter
@@ -63,16 +76,25 @@ def main() -> int:
     ap.add_argument("--write", action="store_true", help="rewrite wake_stage2_expected.h")
     ap.add_argument("--check", action="store_true", help="print vector hashes")
     args = ap.parse_args()
-    it = interpreter(args.model)
-    inp = it.get_input_details()[0]
-    out = it.get_output_details()[0]
-    assert inp["dtype"] == np.int8 and list(inp["shape"]) == [1, 100, 40, 1], inp
+    try:  # preferred: TFLM reference kernels (pip install tflite-micro); the device ESP-NN kernels deviate by a few LSB
+        tflm = _TflmAdapter(args.model)
+        print("reference: TFLM")
+    except Exception:
+        tflm = None
+        it = interpreter(args.model)
+        inp = it.get_input_details()[0]
+        out = it.get_output_details()[0]
+        assert inp["dtype"] == np.int8 and list(inp["shape"]) == [1, 100, 40, 1], inp
+        print("reference: LiteRT (TFLM not installed; values may differ by ~2 from TFLM)")
     got = []
     for k in range(3):
         v = vector(k)
-        it.set_tensor(inp["index"], v.reshape(1, 100, 40, 1))
-        it.invoke()
-        got.append(int(it.get_tensor(out["index"])[0][0]))
+        if tflm is not None:
+            got.append(tflm.predict(v))
+        else:
+            it.set_tensor(inp["index"], v.reshape(1, 100, 40, 1))
+            it.invoke()
+            got.append(int(it.get_tensor(out["index"])[0][0]))
         if args.check:
             print(f"vector {k}: fnv1a32 0x{fnv1a(v):08x}")
     print("expected int8 outputs:", got, "-> scores 0-255:", [g + 128 for g in got])

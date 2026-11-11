@@ -20,3 +20,8 @@ second-stage runner (`wake_stage2.{h,cpp}`, `wake_features.h`, self-test headers
 trigger, runtime mode/threshold/regime setters, inference task stack 3072 -> 4096. All new memory is PSRAM
 (10,500 B history + 40,000 B arena). Fail-open. The PE copy keeps its pre-existing differences from the Sat1
 copy (no atomic cutoff queue, blocking detection-queue send, no [neo-raw]/[neo-mic] diagnostics).
+
+Self-test (v3): expected outputs are the TFLM reference values (-39,-95,-69); tolerance +-12 per vector, plus "not all three identical".
+ESP-NN's optimised kernels on the ESP32-S3 differ from the reference by a few LSB on these extreme synthetic inputs (measured
+on the Voice PE: got -32,-92,-69, dev 7), so the test only catches gross failure. Real-data parity is checked offline from the
+uploaded features (device score vs offline score on the same features). Log: `selftest=PASS got a,b,c dev=N`.
