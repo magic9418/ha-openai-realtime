@@ -1089,17 +1089,17 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   }
 
 
-  // Barge-in policy (see NEO_FULL_DUPLEX_BARGEIN in the header):
-  //  * DEFAULT (half-duplex): don't stream the mic while Neo is speaking, so room cross-talk /
+  // Barge-in policy (runtime `talk_over_`, default NEO_FULL_DUPLEX_BARGEIN in the header; the
+  // session-server sets it per session via "talk_over" in the hello frame):
+  //  * talk_over off (half-duplex): don't stream the mic while Neo is speaking, so room cross-talk /
   //    echo isn't committed as user input. Full-duplex flooded noisy rooms with phantom turns
   //    (a person talking nearby got treated as commands). Barge-in is via the WAKE WORD instead:
   //    micro_wake_word keeps listening locally during the reply, and saying "Neo" fires
   //    voice_assistant_websocket.interrupt (on_wake_word_detected in the YAML).
-  //  * FULL-DUPLEX build (quiet single-person room): define NEO_FULL_DUPLEX_BARGEIN 1 to drop the
-  //    guard and stream continuously so you can talk over Neo to interrupt (relies on XMOS AEC).
+  //  * talk_over on (full-duplex): the guard is skipped and the mic streams continuously so you can
+  //    talk over Neo to interrupt (relies on XMOS AEC; the server decides what counts as a turn).
   // Enrollment pins the mic open regardless of this guard.
-#if !NEO_FULL_DUPLEX_BARGEIN
-  if (this->is_bot_speaking() && !this->enrolling_) {
+  if (!this->talk_over_.load() && this->is_bot_speaking() && !this->enrolling_) {
     // Contiguity invariant (see header): a dropped frame breaks the ring's "recent, continuous room
     // audio" guarantee, so clear it. This is also what keeps Neo's OWN reply out of the look-back —
     // is_bot_speaking() stays true for a beat after stop(), which is exactly when the speaker is
@@ -1107,7 +1107,6 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
     this->preroll_reset_();
     return;
   }
-#endif
 
   // Wake-chime gate: drop uplink for the wake-open window after a wake so the chime doesn't bleed
   // into ASR. The WS connect overlaps this window, so the mic opens ~wake_open_delay_ms after wake
@@ -1692,6 +1691,15 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
             // NEO stage 2: server-pushed mode/threshold (absent key = change nothing). Persisted by the detector.
             uint8_t s2_mode = 0, s2_thr = 0;
             if (wf_parse_wake_stage2(message, s2_mode, s2_thr)) this->apply_wake_stage2_(s2_mode, s2_thr);
+          }
+          {
+            // Talk-over (mic stays open while the reply plays). Key absent -> compile-time default, so
+            // the device never stays in talk-over after the server stops asking for it.
+            bool to = false;
+            const bool want = wf_parse_talk_over(message, to) ? to : (NEO_FULL_DUPLEX_BARGEIN != 0);
+            if (this->talk_over_.exchange(want) != want) {
+              ESP_LOGI(TAG, "hello: talk_over = %s", want ? "on" : "off");
+            }
           }
           this->server_ready_pending_ = true;
         } else if (message.find("\"type\":\"enroll\"") != std::string::npos ||

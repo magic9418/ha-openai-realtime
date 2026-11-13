@@ -174,6 +174,16 @@ inline bool wf_parse_wake_stage2(const std::string &m, uint8_t &mode, uint8_t &t
   return true;
 }
 
+// hello: "talk_over": true|false (JSON boolean). Returns false when the key is absent or not a boolean
+// (caller then falls back to the compile-time default).
+inline bool wf_parse_talk_over(const std::string &m, bool &value) {
+  const size_t v = wf_find_value(m, "\"talk_over\"");
+  if (v == std::string::npos) return false;
+  if (m.compare(v, 4, "true") == 0) { value = true; return true; }
+  if (m.compare(v, 5, "false") == 0) { value = false; return true; }
+  return false;
+}
+
 inline bool wf_hello_is_capture_only(const std::string &m) {
   const size_t v = wf_find_value(m, "\"capture_only\"");
   return v != std::string::npos && m.compare(v, 4, "true") == 0;

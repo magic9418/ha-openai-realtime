@@ -30,6 +30,8 @@ class MicroWakeWord;
 //       Robust in noisy / multi-person rooms (no cross-talk phantom turns).
 //   1 = FULL-DUPLEX — stream mic continuously so you can talk over Neo to interrupt. Only for a
 //       quiet, single-person room (relies on XMOS AEC to reject Neo's own playback).
+// This macro is now only the DEFAULT of the runtime `talk_over_` flag: the session-server pushes
+// "talk_over": true|false in every hello, and an absent key resets the flag to this default.
 #ifndef NEO_FULL_DUPLEX_BARGEIN
 #define NEO_FULL_DUPLEX_BARGEIN 0
 #endif
@@ -428,6 +430,11 @@ class VoiceAssistantWebSocket : public Component {
   // of after it. Lets the mic open ~wake_open_delay_ms after wake regardless of connect latency,
   // instead of chime + delay + connect (which ate the front of the user's command). 0 = no gate.
   uint32_t mic_gate_until_{0};
+
+  // Talk-over (full-duplex uplink): when true the mic keeps streaming while the reply plays.
+  // Written by the websocket task on hello, read by the mic task. Default = NEO_FULL_DUPLEX_BARGEIN;
+  // reset to that default on every hello that lacks the key, so a server rollback can't leave it on.
+  std::atomic<bool> talk_over_{NEO_FULL_DUPLEX_BARGEIN != 0};
 
   // Enrollment mode: mic pinned open + streaming, wake/stop models disarmed by YAML.
   // Auto-restores on {"enroll","stop"}, WS drop, or the 15-min safety cap.

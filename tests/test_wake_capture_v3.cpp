@@ -42,6 +42,12 @@ int main() {
   CHECK(!wf_parse_wake_stage2("{\"wake_stage2\":{\"mode\":\"bogus\",\"threshold\":3}}", m, t));
   CHECK(!wf_parse_wake_stage2("{\"wake_stage2\":{\"mode\":\"off\",\"threshold\":300}}", m, t));
   CHECK(!wf_parse_wake_stage2("{\"type\":\"hello\"}", m, t));
+  bool to = false;
+  CHECK(wf_parse_talk_over("{\"type\":\"hello\",\"talk_over\": true}", to) && to);
+  CHECK(wf_parse_talk_over("{\"talk_over\":false,\"wake_open_delay_ms\":200}", to) && !to);
+  CHECK(!wf_parse_talk_over("{\"type\":\"hello\"}", to));
+  CHECK(!wf_parse_talk_over("{\"talk_over\":\"true\"}", to));
+  CHECK(!wf_parse_talk_over("{\"talk_over\":1}", to));
   CHECK(wf_hello_is_capture_only("{\"type\":\"hello\",\"capture_only\":true}"));
   CHECK(!wf_hello_is_capture_only("{\"type\":\"hello\",\"wake_open_delay_ms\":200}"));
   bool ok = false;
