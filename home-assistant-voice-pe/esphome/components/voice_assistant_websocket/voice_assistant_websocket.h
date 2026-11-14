@@ -4,6 +4,7 @@
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/components/speaker/speaker.h"
 #include "esphome/core/automation.h"
+#include "esphome/core/static_task.h"
 #ifdef USE_ESP_IDF
 #include "esp_websocket_client.h"
 #include "esp_http_client.h"
@@ -68,6 +69,8 @@ class VoiceAssistantWebSocket : public Component {
   void set_uplink_gain_factor(uint16_t gain) { this->uplink_gain_factor_ = gain; }
   // Development heap diagnostics (JSON "diag" text frames to the server; main loop only).
   void set_heap_diag(bool on) { this->heap_diag_ = on; }
+  // Uplink sender task stack in PSRAM (falls back to internal RAM if the PSRAM stack cannot be created).
+  void set_task_stack_in_psram(bool on) { this->task_stack_in_psram_ = on; }
   // Wake-trigger capture metadata (compile-time facts about the detector; see capture_wake_trigger).
   void set_wake_trigger_meta(const std::string &model, const std::string &fw, uint8_t window) {
     this->wt_model_ = model;
@@ -445,11 +448,15 @@ class VoiceAssistantWebSocket : public Component {
   // ---- heap diagnostics (heap_diag: true). All sends happen on the MAIN loop. Other tasks only set
   // diag_audio_pending_. ----
   bool heap_diag_{false};
+  bool task_stack_in_psram_{false};
+  StaticTask uplink_static_task_;      // only used when task_stack_in_psram_ (never destroy(): task self-deletes)
+  bool diag_wake_valid_{false};        // pre-connect heap snapshot taken in start() (main task)
+  uint32_t diag_wake_if_{0}, diag_wake_im_{0}, diag_wake_ib_{0};
   bool diag_session_open_{false};      // main loop only
   bool diag_verbose_done_{false};      // main loop only: verbose corrupt-block print at most once/session
   uint32_t diag_last_tick_{0};         // main loop only
   std::atomic<bool> diag_audio_pending_{false};  // set by the websocket task on the first chunk of a reply
-  void heap_diag_send_(const char *ev);
+  void heap_diag_send_(const char *ev, const uint32_t *snap = nullptr);  // snap = {if, im, ib} override
   void heap_diag_session_start_();
   void heap_diag_loop_();
 

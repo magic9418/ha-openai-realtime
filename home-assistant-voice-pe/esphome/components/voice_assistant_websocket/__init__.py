@@ -27,6 +27,7 @@ CONF_ENROLLMENT_WAKE_CHANNEL = "enrollment_wake_channel"
 CONF_ENROLLMENT_WAKE_GAIN = "enrollment_wake_gain_factor"
 CONF_UPLINK_GAIN = "uplink_gain_factor"
 CONF_HEAP_DIAG = "heap_diag"
+CONF_TASK_STACK_IN_PSRAM = "task_stack_in_psram"
 CONF_WAKE_TRIGGER_MODEL = "wake_trigger_model"
 CONF_WAKE_TRIGGER_FW = "wake_trigger_fw"
 CONF_WAKE_TRIGGER_WINDOW = "wake_trigger_window"
@@ -56,6 +57,8 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_UPLINK_GAIN, default=1): cv.int_range(min=1, max=512),
         # Development: report heap stats + integrity check to the server (JSON "diag" frames).
         cv.Optional(CONF_HEAP_DIAG, default=False): cv.boolean,
+        # Put the persistent uplink sender task's stack in PSRAM (frees 4 KB of scarce internal RAM).
+        cv.Optional(CONF_TASK_STACK_IN_PSRAM, default=False): cv.boolean,
         cv.Optional(CONF_WAKE_TRIGGER_MODEL, default="unknown"): cv.string,
         cv.Optional(CONF_WAKE_TRIGGER_FW, default="unknown"): cv.string,
         cv.Optional(CONF_WAKE_TRIGGER_WINDOW, default=0): cv.int_range(min=0, max=255),
@@ -110,6 +113,7 @@ async def to_code(config):
     cg.add(var.set_hold_duck(config[CONF_HOLD_DUCK]))
     cg.add(var.set_uplink_gain_factor(config[CONF_UPLINK_GAIN]))
     cg.add(var.set_heap_diag(config[CONF_HEAP_DIAG]))
+    cg.add(var.set_task_stack_in_psram(config[CONF_TASK_STACK_IN_PSRAM]))
     if CONF_WAKE_DETECTOR in config:
         det = await cg.get_variable(config[CONF_WAKE_DETECTOR])
         cg.add(var.set_wake_detector(det))

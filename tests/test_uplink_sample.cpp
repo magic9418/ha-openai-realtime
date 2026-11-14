@@ -29,13 +29,15 @@ int main() {
   CHECK(uplink_sample(-0x01000000, 128) == -32768);
   CHECK(uplink_sample(-0x01000000, 64) == -16384);
   // diag frame
-  char b[200];
-  int n = heap_diag_format(b, sizeof b, "start", 12, 3, 40000, 30000, 20000, 7000000, 6000000, 1, 123);
+  char b[224];
+  int n = heap_diag_format(b, sizeof b, "start", 12, 3, 40000, 30000, 20000, 7000000, 6000000, 1, 123, 5200, 2100);
   CHECK(n > 0 && n < (int) sizeof b);
-  CHECK(strcmp(b, "{\"type\":\"diag\",\"ev\":\"start\",\"up\":12,\"rr\":3,\"if\":40000,\"im\":30000,\"ib\":20000,\"pf\":7000000,\"pm\":6000000,\"ok\":1,\"us\":123}") == 0);
+  CHECK(strcmp(b, "{\"type\":\"diag\",\"ev\":\"start\",\"up\":12,\"rr\":3,\"if\":40000,\"im\":30000,\"ib\":20000,\"pf\":7000000,\"pm\":6000000,\"ok\":1,\"us\":123,\"wh\":5200,\"uh\":2100}") == 0);
   // worst-case widths still fit in the 200-byte stack buffer
-  n = heap_diag_format(b, sizeof b, "audio", 4294967295u, 15, 4294967295u, 4294967295u, 4294967295u, 4294967295u, 4294967295u, 0, 4294967295u);
-  CHECK(n > 0 && n < 200);
+  n = heap_diag_format(b, sizeof b, "audio", 4294967295u, 15, 4294967295u, 4294967295u, 4294967295u, 4294967295u, 4294967295u, 0, 4294967295u, 2147483647, 2147483647);
+  CHECK(n > 0 && n < 224);
+  n = heap_diag_format(b, sizeof b, "wake", 1, 1, 1, 1, 1, 1, 1, 1, 1);  // wh/uh default -1
+  CHECK(strstr(b, "\"wh\":-1,\"uh\":-1}") != nullptr);
   printf("%s (worst-case frame %d bytes)\n", fails ? "FAILED" : "ALL PASS", n);
   return fails;
 }

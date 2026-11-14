@@ -33,7 +33,7 @@ substitutions:
   # /home/matt/projects/penny/firmware/satellite1 (shared_components.lock.json, verify_shared_components.py)
   # at /satellite1 so '../../satellite1' resolves (natively it is firmware/voice-pe/home-assistant-voice-pe/../../satellite1);
   # run verify_shared_components.py first. The sibling must be content-identical to the lock (959d4c1 components).
-  esp32_fw_version: neo-2026.11.14-office-stage2-v4-talkover3
+  esp32_fw_version: neo-2026.11.14-office-stage2-v4-talkover4
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -1093,6 +1093,7 @@ speaker:
   # This enables ducking functionality (lowering media volume when voice assistant speaks)
   - platform: mixer
     id: mixing_speaker
+    task_stack_in_psram: true   # talkover4: internal RAM is exhausted (websocket task create failed at ~13 KB free); stack lives in PSRAM
     output_speaker: i2s_audio_speaker
     num_channels: 2
     source_speakers:
@@ -1104,6 +1105,7 @@ speaker:
   # Resampler for voice assistant announcements (24kHz -> 48kHz)
   - platform: resampler
     id: announcement_resampling_speaker
+    task_stack_in_psram: true   # talkover4: internal RAM is exhausted (websocket task create failed at ~13 KB free); stack lives in PSRAM
     output_speaker: announcement_mixing_input
     sample_rate: 48000
     bits_per_sample: 16
@@ -1112,6 +1114,7 @@ speaker:
   # Used directly by voice_assistant_websocket component
   - platform: resampler
     id: voice_resampling_speaker
+    task_stack_in_psram: true   # talkover4: internal RAM is exhausted (websocket task create failed at ~13 KB free); stack lives in PSRAM
     output_speaker: announcement_mixing_input
     sample_rate: 48000  # Output sample rate
     bits_per_sample: 16
@@ -1134,6 +1137,7 @@ sendspin:
 media_source:
   - platform: audio_file
     id: announcement_audio_file_source
+    task_stack_in_psram: true   # talkover4: internal RAM is exhausted (websocket task create failed at ~13 KB free); stack lives in PSRAM
   - platform: sendspin
     id: sendspin_media_source
 
@@ -1406,6 +1410,8 @@ voice_assistant_websocket:
   # DEVELOPMENT: report heap stats + integrity check to the server as {"type":"diag",...} frames
   # (start / audio / tick every 2 s / end). Main loop only. See wakeword/builds/2026-11-14/README.md.
   heap_diag: true
+  # talkover4: the persistent uplink sender task's 4 KB stack lives in PSRAM (falls back to internal RAM).
+  task_stack_in_psram: true
   wake_trigger_model: ${wake_word_model}
   wake_trigger_window: ${wake_penny_window}
   wake_trigger_fw: ${esp32_fw_version}

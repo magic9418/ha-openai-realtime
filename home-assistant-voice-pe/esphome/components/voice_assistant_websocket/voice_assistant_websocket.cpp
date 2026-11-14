@@ -280,6 +280,11 @@ void VoiceAssistantWebSocket::heap_diag_session_start_() {
   this->diag_audio_pending_ = false;
   this->diag_last_tick_ = millis();
   this->heap_diag_send_("start");
+  if (this->diag_wake_valid_) {
+    this->diag_wake_valid_ = false;
+    const uint32_t snap[3] = {this->diag_wake_if_, this->diag_wake_im_, this->diag_wake_ib_};
+    this->heap_diag_send_("wake", snap);
+  }
 }
 
 void VoiceAssistantWebSocket::heap_diag_loop_() {
@@ -296,7 +301,7 @@ void VoiceAssistantWebSocket::heap_diag_loop_() {
   }
 }
 
-void VoiceAssistantWebSocket::heap_diag_send_(const char *ev) {
+void VoiceAssistantWebSocket::heap_diag_send_(const char *ev, const uint32_t *snap) {
   const int64_t t0 = esp_timer_get_time();
   const bool ok = heap_caps_check_integrity_all(false);
   const uint32_t us = (uint32_t) (esp_timer_get_time() - t0);
@@ -305,14 +310,18 @@ void VoiceAssistantWebSocket::heap_diag_send_(const char *ev) {
     ESP_LOGE(TAG, "HEAP CORRUPTION detected (ev=%s); printing corrupt blocks", ev);
     heap_caps_check_integrity_all(true);
   }
-  char buf[200];
+  // Stack high-water marks (bytes never used). -1 = task not present / not running.
+  int wh = -1, uh = -1;
+  if (TaskHandle_t h = xTaskGetHandle("va_websocket")) wh = (int) uxTaskGetStackHighWaterMark(h);
+  if (this->uplink_task_ != nullptr && this->uplink_task_running_) uh = (int) uxTaskGetStackHighWaterMark(this->uplink_task_);
+  char buf[224];
   const int n = heap_diag_format(
       buf, sizeof(buf), ev, (uint32_t) (esp_timer_get_time() / 1000000), (int) esp_reset_reason(),
-      (uint32_t) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-      (uint32_t) heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
-      (uint32_t) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+      snap ? snap[0] : (uint32_t) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+      snap ? snap[1] : (uint32_t) heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+      snap ? snap[2] : (uint32_t) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
       (uint32_t) heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-      (uint32_t) heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM), ok ? 1 : 0, us);
+      (uint32_t) heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM), ok ? 1 : 0, us, wh, uh);
   if (n <= 0 || n >= (int) sizeof(buf)) return;
   if (!this->is_connected() || this->websocket_client_ == nullptr) return;
   if (esp_websocket_client_send_text(this->websocket_client_, buf, n, pdMS_TO_TICKS(50)) < 0)
@@ -394,6 +403,13 @@ void VoiceAssistantWebSocket::start() {
   
   this->defer_event_(DeferredEvent::EV_STATE_CALLBACK, this->state_);
   
+  if (this->heap_diag_) {
+    // Heap available BEFORE this session allocates anything (websocket client + task, TLS-free TCP).
+    this->diag_wake_if_ = (uint32_t) heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    this->diag_wake_im_ = (uint32_t) heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    this->diag_wake_ib_ = (uint32_t) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    this->diag_wake_valid_ = true;
+  }
   this->connect_websocket_();
 }
 
@@ -467,6 +483,9 @@ void VoiceAssistantWebSocket::connect_websocket_() {
   websocket_cfg.buffer_size = 1024;
   websocket_cfg.task_prio = 5;
   websocket_cfg.task_stack = 8192;
+  // Distinct name (the intercom clients use the default "websocket_task") so heap_diag can find THIS
+  // client's task with xTaskGetHandle().
+  websocket_cfg.task_name = "va_websocket";
   websocket_cfg.transport = WEBSOCKET_TRANSPORT_OVER_TCP;  // Use TCP (not SSL) for ws://
   websocket_cfg.network_timeout_ms = 30000;  // 30 second timeout for network operations
   websocket_cfg.reconnect_timeout_ms = 10000;  // (unused: auto-reconnect disabled below)
@@ -494,7 +513,9 @@ void VoiceAssistantWebSocket::connect_websocket_() {
   // Start connection
   esp_err_t err = esp_websocket_client_start(this->websocket_client_);
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to start WebSocket client: %s", esp_err_to_name(err));
+    ESP_LOGE(TAG, "Failed to start WebSocket client: %s (internal free %u B, largest block %u B)",
+             esp_err_to_name(err), (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     esp_websocket_client_destroy(this->websocket_client_);
     this->websocket_client_ = nullptr;
     this->state_ = VOICE_ASSISTANT_WEBSOCKET_ERROR;
@@ -894,7 +915,20 @@ void VoiceAssistantWebSocket::uplink_init_() {
     // own receive/dispatch task; both sit far below the i2s mic task (17), whose latency is the
     // entire point of this change, and well above the ESPHome main loop (1) so audio keeps moving
     // while loop() works.
-    if (xTaskCreate(&VoiceAssistantWebSocket::uplink_task_fn_, "va_ws_uplink", 4096, this, 5,
+    bool created = false;
+    if (this->task_stack_in_psram_) {
+      // Same helper as the ESPHome resampler/mixer/mww tasks. Priority and lifetime are unchanged.
+      if (this->uplink_static_task_.create(&VoiceAssistantWebSocket::uplink_task_fn_, "va_ws_uplink", 4096, this, 5,
+                                           true)) {
+        this->uplink_task_ = this->uplink_static_task_.get_handle();
+        created = true;
+        ESP_LOGI(TAG, "Uplink sender task stack is in PSRAM");
+      } else {
+        ESP_LOGW(TAG, "PSRAM stack for uplink sender task failed; using internal RAM");
+      }
+    }
+    if (!created &&
+        xTaskCreate(&VoiceAssistantWebSocket::uplink_task_fn_, "va_ws_uplink", 4096, this, 5,
                     &this->uplink_task_) != pdPASS) {
       this->uplink_task_ = nullptr;
       ESP_LOGE(TAG, "Failed to create uplink sender task - falling back to blocking sends");
