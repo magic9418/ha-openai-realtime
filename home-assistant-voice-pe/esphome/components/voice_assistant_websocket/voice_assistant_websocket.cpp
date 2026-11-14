@@ -314,15 +314,21 @@ void VoiceAssistantWebSocket::heap_diag_send_(const char *ev, const uint32_t *sn
   int wh = -1, uh = -1;
   if (TaskHandle_t h = xTaskGetHandle("va_websocket")) wh = (int) uxTaskGetStackHighWaterMark(h);
   if (this->uplink_task_ != nullptr && this->uplink_task_running_) uh = (int) uxTaskGetStackHighWaterMark(this->uplink_task_);
-  char buf[224];
+  int sh = -1, mh = -1;
+  if (TaskHandle_t h = xTaskGetHandle("speaker_task")) sh = (int) uxTaskGetStackHighWaterMark(h);
+  if (TaskHandle_t h = xTaskGetHandle("mic_task")) mh = (int) uxTaskGetStackHighWaterMark(h);
+  // heap_diag_send_ always runs on the main loop task, so the current task IS the loop task.
+  const int lh = (int) uxTaskGetStackHighWaterMark(nullptr);
+  char buf[320];
   const int n = heap_diag_format(
       buf, sizeof(buf), ev, (uint32_t) (esp_timer_get_time() / 1000000), (int) esp_reset_reason(),
       snap ? snap[0] : (uint32_t) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
       snap ? snap[1] : (uint32_t) heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
       snap ? snap[2] : (uint32_t) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
       (uint32_t) heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-      (uint32_t) heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM), ok ? 1 : 0, us, wh, uh);
+      (uint32_t) heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM), ok ? 1 : 0, us, wh, uh, sh, mh, lh);
   if (n <= 0 || n >= (int) sizeof(buf)) return;
+  if (strcmp(ev, "tick") != 0) ESP_LOGI(TAG, "[diag] %s", buf);   // wake/start/audio/end only; not every tick
   if (!this->is_connected() || this->websocket_client_ == nullptr) return;
   if (esp_websocket_client_send_text(this->websocket_client_, buf, n, pdMS_TO_TICKS(50)) < 0)
     ESP_LOGW(TAG, "diag frame send failed (ev=%s)", ev);
@@ -498,9 +504,12 @@ void VoiceAssistantWebSocket::connect_websocket_() {
   
   this->websocket_client_ = esp_websocket_client_init(&websocket_cfg);
   if (this->websocket_client_ == nullptr) {
-    ESP_LOGE(TAG, "Failed to initialize WebSocket client");
+    ESP_LOGE(TAG, "Failed to initialize WebSocket client (internal free %u B, largest block %u B)",
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     this->state_ = VOICE_ASSISTANT_WEBSOCKET_ERROR;
     this->defer_event_(DeferredEvent::EV_STATE_CALLBACK, this->state_);
+    this->fail_session_to_idle_();
     return;
   }
   
@@ -520,7 +529,18 @@ void VoiceAssistantWebSocket::connect_websocket_() {
     this->websocket_client_ = nullptr;
     this->state_ = VOICE_ASSISTANT_WEBSOCKET_ERROR;
     this->defer_event_(DeferredEvent::EV_STATE_CALLBACK, this->state_);
+    this->fail_session_to_idle_();
   }
+}
+
+// A session that never got a websocket client must still end in IDLE (LED idle, media un-ducked, wake word
+// re-armed by the stopped/error automations) so the next wake can try again. Same path as a websocket
+// transport error: error automation, then the loop()'s pending_disconnect_ handler (no client -> straight to IDLE).
+void VoiceAssistantWebSocket::fail_session_to_idle_() {
+  this->reconnect_pending_ = false;
+  this->wake_reconnect_queued_ = false;
+  this->defer_event_(DeferredEvent::EV_ERROR);
+  this->pending_disconnect_ = true;
 }
 
 bool VoiceAssistantWebSocket::disconnect_websocket_() {
@@ -532,6 +552,8 @@ bool VoiceAssistantWebSocket::disconnect_websocket_() {
     this->disconnect_client_ = nullptr;
     this->disconnect_task_done_ = false;
     this->disconnect_task_active_ = false;
+    // A PSRAM-stack worker parks itself; delete it now (the stack buffer stays allocated for the next teardown).
+    if (this->disconnect_task_static_.exchange(false)) this->disconnect_static_task_.destroy();
     this->uplink_paused_ = false;
     this->uplink_reset_();
     ESP_LOGD(TAG, "WebSocket teardown worker complete");
@@ -541,6 +563,8 @@ bool VoiceAssistantWebSocket::disconnect_websocket_() {
   if (this->websocket_client_ == nullptr) {
     return true;
   }
+  // Teardown worker could not be created last time: wait out the retry interval (500 ms) instead of spinning.
+  if (this->disconnect_retry_wait_ && static_cast<int32_t>(millis() - this->disconnect_next_try_ms_) < 0) return false;
   ESP_LOGI(TAG, "Disconnecting WebSocket...");
 
   // INVARIANT: the uplink sender task must not be inside esp_websocket_client_send_bin() when the
@@ -568,10 +592,35 @@ bool VoiceAssistantWebSocket::disconnect_websocket_() {
   this->disconnect_client_ = client;
   this->disconnect_task_done_ = false;
   this->disconnect_task_active_ = true;
-  BaseType_t created = xTaskCreate(
-      &VoiceAssistantWebSocket::disconnect_task_fn_, "va_ws_cleanup", 4096, this, 4, nullptr);
-  if (created != pdPASS) {
-    ESP_LOGE(TAG, "Could not create WebSocket teardown worker; retrying next loop");
+  bool created = false;
+  if (this->task_stack_in_psram_) {
+    // PSRAM stack + the TCB inside this object: needs NO internal heap, so internal exhaustion cannot block it.
+    this->disconnect_task_static_ = true;
+    created = this->disconnect_static_task_.create(&VoiceAssistantWebSocket::disconnect_task_fn_, "va_ws_cleanup", 4096,
+                                                   this, 4, true);
+    if (!created) {
+      this->disconnect_task_static_ = false;
+      ESP_LOGW(TAG, "PSRAM stack for teardown worker failed; trying internal RAM");
+    }
+  }
+  if (!created) {
+    created = xTaskCreate(&VoiceAssistantWebSocket::disconnect_task_fn_, "va_ws_cleanup", 4096, this, 4, nullptr) == pdPASS;
+  }
+  if (created) {
+    this->disconnect_create_failures_ = 0;
+    this->disconnect_retry_wait_ = false;
+  } else {
+    // Never leave the session half-closed: the client is restored and the main loop retries every 500 ms
+    // (loop() keeps pending_disconnect_ set). No synchronous fallback: esp_websocket_client_stop()/destroy()
+    // wait portMAX_DELAY for the client task, which would park the main loop unboundedly.
+    if (this->disconnect_create_failures_ < 255) this->disconnect_create_failures_++;
+    this->disconnect_retry_wait_ = true;
+    this->disconnect_next_try_ms_ = millis() + 500;
+    if (this->disconnect_create_failures_ == 1 || this->disconnect_create_failures_ % 10 == 0) {
+      ESP_LOGE(TAG, "Could not create WebSocket teardown worker (attempt %u; internal free %u B, largest block %u B); retrying in 500 ms",
+               (unsigned) this->disconnect_create_failures_, (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+               (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
     this->disconnect_task_active_ = false;
     this->disconnect_client_ = nullptr;
     this->websocket_client_ = client;
@@ -601,6 +650,9 @@ void VoiceAssistantWebSocket::disconnect_task_fn_(void *param) {
   }
 
   self->disconnect_task_done_ = true;
+  if (self->disconnect_task_static_.load()) {
+    for (;;) vTaskSuspend(nullptr);  // main loop destroy()s this static task; the stack is kept for reuse
+  }
   vTaskDelete(nullptr);
 }
 

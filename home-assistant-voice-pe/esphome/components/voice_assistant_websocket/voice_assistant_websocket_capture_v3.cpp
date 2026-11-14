@@ -149,8 +149,18 @@ void VoiceAssistantWebSocket::co_teardown_(bool graceful) {
   if (client == nullptr) return;
   this->co_cleanup_client_ = client;
   this->co_cleanup_graceful_ = graceful;
+  // Previous PSRAM-stack worker is parked once its job finished: delete it (stack kept) before reusing.
+  if (!this->co_cleanup_active_.load() && this->co_cleanup_static_.exchange(false)) this->co_static_task_.destroy();
   this->co_cleanup_active_ = true;
-  if (xTaskCreate(&VoiceAssistantWebSocket::co_cleanup_task_, "va_co_clean", 4096, this, 3, nullptr) != pdPASS) {
+  bool co_created = false;
+  if (this->task_stack_in_psram_) {
+    this->co_cleanup_static_ = true;
+    co_created = this->co_static_task_.create(&VoiceAssistantWebSocket::co_cleanup_task_, "va_co_clean", 4096, this, 3, true);
+    if (!co_created) this->co_cleanup_static_ = false;
+  }
+  if (!co_created)
+    co_created = xTaskCreate(&VoiceAssistantWebSocket::co_cleanup_task_, "va_co_clean", 4096, this, 3, nullptr) == pdPASS;
+  if (!co_created) {
     ESP_LOGW(TAG, "Capture-only: no cleanup worker; closing inline");
     esp_websocket_client_stop(client);
     esp_websocket_client_destroy(client);
@@ -172,6 +182,9 @@ void VoiceAssistantWebSocket::co_cleanup_task_(void *param) {
   }
   self->co_cleanup_client_ = nullptr;
   self->co_cleanup_active_ = false;
+  if (self->co_cleanup_static_.load()) {
+    for (;;) vTaskSuspend(nullptr);  // destroy()ed by the next co_teardown_(); stack kept
+  }
   vTaskDelete(nullptr);
 }
 

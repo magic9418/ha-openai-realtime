@@ -450,6 +450,15 @@ class VoiceAssistantWebSocket : public Component {
   bool heap_diag_{false};
   bool task_stack_in_psram_{false};
   StaticTask uplink_static_task_;      // only used when task_stack_in_psram_ (never destroy(): task self-deletes)
+  // Teardown worker (va_ws_cleanup): PSRAM stack via StaticTask when task_stack_in_psram_, else internal xTaskCreate.
+  // A static worker does not self-delete: it suspends and the main loop destroy()s it (stack kept for reuse).
+  StaticTask disconnect_static_task_;
+  std::atomic<bool> disconnect_task_static_{false};
+  uint8_t disconnect_create_failures_{0};   // consecutive failed worker creations (main task)
+  bool disconnect_retry_wait_{false};
+  uint32_t disconnect_next_try_ms_{0};
+  StaticTask co_static_task_;               // capture-only cleanup worker, same scheme
+  std::atomic<bool> co_cleanup_static_{false};
   bool diag_wake_valid_{false};        // pre-connect heap snapshot taken in start() (main task)
   uint32_t diag_wake_if_{0}, diag_wake_im_{0}, diag_wake_ib_{0};
   bool diag_session_open_{false};      // main loop only
@@ -459,6 +468,7 @@ class VoiceAssistantWebSocket : public Component {
   void heap_diag_send_(const char *ev, const uint32_t *snap = nullptr);  // snap = {if, im, ib} override
   void heap_diag_session_start_();
   void heap_diag_loop_();
+  void fail_session_to_idle_();
 
   // Enrollment mode: mic pinned open + streaming, wake/stop models disarmed by YAML.
   // Auto-restores on {"enroll","stop"}, WS drop, or the 15-min safety cap.

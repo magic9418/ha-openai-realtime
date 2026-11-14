@@ -33,7 +33,7 @@ substitutions:
   # /home/matt/projects/penny/firmware/satellite1 (shared_components.lock.json, verify_shared_components.py)
   # at /satellite1 so '../../satellite1' resolves (natively it is firmware/voice-pe/home-assistant-voice-pe/../../satellite1);
   # run verify_shared_components.py first. The sibling must be content-identical to the lock (959d4c1 components).
-  esp32_fw_version: neo-2026.11.14-office-stage2-v4-talkover4
+  esp32_fw_version: neo-2026.11.14-office-stage2-v4-talkover5
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -151,6 +151,11 @@ esp32:
       # of corrupting the free list silently (the talkover2 StoreProhibited in tlsf_malloc). Costs a
       # few bytes per allocation; remove once the crash is found.
       CONFIG_HEAP_POISONING_LIGHT: "y"
+      # talkover5: reclaim internal RAM (idle free was ~13 KB after one session). WiFi static RX buffers
+      # are internal RAM, ~1.6 KB each: 16 -> 8 frees ~13 KB. RX BA window kept <= 2x the static count
+      # (it was 32). DYNAMIC_RX, TCP window and TX settings are deliberately untouched.
+      CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM: "8"
+      CONFIG_ESP_WIFI_RX_BA_WIN: "16"
 
 wifi:
   id: wifi_id
