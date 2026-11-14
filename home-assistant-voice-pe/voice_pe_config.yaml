@@ -33,7 +33,7 @@ substitutions:
   # /home/matt/projects/penny/firmware/satellite1 (shared_components.lock.json, verify_shared_components.py)
   # at /satellite1 so '../../satellite1' resolves (natively it is firmware/voice-pe/home-assistant-voice-pe/../../satellite1);
   # run verify_shared_components.py first. The sibling must be content-identical to the lock (959d4c1 components).
-  esp32_fw_version: neo-2026.11.14-office-stage2-v4-talkover2
+  esp32_fw_version: neo-2026.11.14-office-stage2-v4-talkover3
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -146,6 +146,11 @@ esp32:
       CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER: "y"
       CONFIG_WS_DYNAMIC_BUFFER: "y"
       CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"
+      # DEVELOPMENT (2026-11-14, talkover3): light heap poisoning = head/tail canaries on every heap
+      # block, so a heap overrun is NAMED when detected (heap_caps_check_integrity_all, free) instead
+      # of corrupting the free list silently (the talkover2 StoreProhibited in tlsf_malloc). Costs a
+      # few bytes per allocation; remove once the crash is found.
+      CONFIG_HEAP_POISONING_LIGHT: "y"
 
 wifi:
   id: wifi_id
@@ -1394,6 +1399,13 @@ voice_assistant_websocket:
   # exactly what the model scored. Model name = basename of ${wake_word_model}.
   enrollment_wake_channel: 1
   enrollment_wake_gain_factor: 4
+  # Uplink (command) gain, fixed integer, applied on the 32-bit sample for resolution. Channel 0 has
+  # been taken after NS (no AGC) since 2026-11-14 and is ~46 dB below the AGC level (measured peak
+  # ~135/32768 vs 15000-30000). 64 = +36 dB. Fine trim is the server's per-room `input_gain`.
+  uplink_gain_factor: 64
+  # DEVELOPMENT: report heap stats + integrity check to the server as {"type":"diag",...} frames
+  # (start / audio / tick every 2 s / end). Main loop only. See wakeword/builds/2026-11-14/README.md.
+  heap_diag: true
   wake_trigger_model: ${wake_word_model}
   wake_trigger_window: ${wake_penny_window}
   wake_trigger_fw: ${esp32_fw_version}

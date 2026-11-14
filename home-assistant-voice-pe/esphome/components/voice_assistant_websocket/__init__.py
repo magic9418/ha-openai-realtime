@@ -25,6 +25,8 @@ _MicroWakeWord = cg.esphome_ns.namespace("micro_wake_word").class_("MicroWakeWor
 # reported with each captured trigger (wake_trigger_capture.h).
 CONF_ENROLLMENT_WAKE_CHANNEL = "enrollment_wake_channel"
 CONF_ENROLLMENT_WAKE_GAIN = "enrollment_wake_gain_factor"
+CONF_UPLINK_GAIN = "uplink_gain_factor"
+CONF_HEAP_DIAG = "heap_diag"
 CONF_WAKE_TRIGGER_MODEL = "wake_trigger_model"
 CONF_WAKE_TRIGGER_FW = "wake_trigger_fw"
 CONF_WAKE_TRIGGER_WINDOW = "wake_trigger_window"
@@ -50,6 +52,10 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_ENROLLMENT_WAKE_CHANNEL, default=1): cv.int_range(min=0, max=1),
         cv.Optional(CONF_ENROLLMENT_WAKE_GAIN, default=4): cv.int_range(min=1, max=64),
         # Model path or name; only the basename without extension is reported (e.g. penny_v5_oct1).
+        # Fixed integer gain on the 32-bit sample of the command/uplink path only (1 = unchanged).
+        cv.Optional(CONF_UPLINK_GAIN, default=1): cv.int_range(min=1, max=512),
+        # Development: report heap stats + integrity check to the server (JSON "diag" frames).
+        cv.Optional(CONF_HEAP_DIAG, default=False): cv.boolean,
         cv.Optional(CONF_WAKE_TRIGGER_MODEL, default="unknown"): cv.string,
         cv.Optional(CONF_WAKE_TRIGGER_FW, default="unknown"): cv.string,
         cv.Optional(CONF_WAKE_TRIGGER_WINDOW, default=0): cv.int_range(min=0, max=255),
@@ -102,6 +108,8 @@ async def to_code(config):
         )
     )
     cg.add(var.set_hold_duck(config[CONF_HOLD_DUCK]))
+    cg.add(var.set_uplink_gain_factor(config[CONF_UPLINK_GAIN]))
+    cg.add(var.set_heap_diag(config[CONF_HEAP_DIAG]))
     if CONF_WAKE_DETECTOR in config:
         det = await cg.get_variable(config[CONF_WAKE_DETECTOR])
         cg.add(var.set_wake_detector(det))

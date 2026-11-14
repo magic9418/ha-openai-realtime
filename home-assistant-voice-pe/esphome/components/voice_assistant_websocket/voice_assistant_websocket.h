@@ -18,6 +18,8 @@
 #include <queue>
 #include <atomic>
 #include "wake_capture_sample.h"
+#include "uplink_sample.h"
+#include "heap_diag.h"
 #include "wake_trigger_capture.h"
 #include "wake_capture_v3.h"
 
@@ -62,6 +64,10 @@ class VoiceAssistantWebSocket : public Component {
   // frames exactly like it: channel select + Q31->Q25 gain/clamp). PE: channel 1, gain 4.
   void set_enrollment_wake_channel(uint8_t channel) { this->enrollment_wake_channel_ = channel; }
   void set_enrollment_wake_gain_factor(uint8_t gain) { this->enrollment_wake_gain_factor_ = gain; }
+  // Fixed gain on the command/uplink conversion only (not wake_tap / enrollment / wake-trigger). 1 = unchanged.
+  void set_uplink_gain_factor(uint16_t gain) { this->uplink_gain_factor_ = gain; }
+  // Development heap diagnostics (JSON "diag" text frames to the server; main loop only).
+  void set_heap_diag(bool on) { this->heap_diag_ = on; }
   // Wake-trigger capture metadata (compile-time facts about the detector; see capture_wake_trigger).
   void set_wake_trigger_meta(const std::string &model, const std::string &fw, uint8_t window) {
     this->wt_model_ = model;
@@ -435,6 +441,17 @@ class VoiceAssistantWebSocket : public Component {
   // Written by the websocket task on hello, read by the mic task. Default = NEO_FULL_DUPLEX_BARGEIN;
   // reset to that default on every hello that lacks the key, so a server rollback can't leave it on.
   std::atomic<bool> talk_over_{NEO_FULL_DUPLEX_BARGEIN != 0};
+  uint16_t uplink_gain_factor_{1};
+  // ---- heap diagnostics (heap_diag: true). All sends happen on the MAIN loop. Other tasks only set
+  // diag_audio_pending_. ----
+  bool heap_diag_{false};
+  bool diag_session_open_{false};      // main loop only
+  bool diag_verbose_done_{false};      // main loop only: verbose corrupt-block print at most once/session
+  uint32_t diag_last_tick_{0};         // main loop only
+  std::atomic<bool> diag_audio_pending_{false};  // set by the websocket task on the first chunk of a reply
+  void heap_diag_send_(const char *ev);
+  void heap_diag_session_start_();
+  void heap_diag_loop_();
 
   // Enrollment mode: mic pinned open + streaming, wake/stop models disarmed by YAML.
   // Auto-restores on {"enroll","stop"}, WS drop, or the 15-min safety cap.

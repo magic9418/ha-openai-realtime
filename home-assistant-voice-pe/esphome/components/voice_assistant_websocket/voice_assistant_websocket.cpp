@@ -10,6 +10,8 @@
 #include "esphome/components/neo_intercom/neo_intercom.h"
 #endif
 #include <cstring>
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include <algorithm>
 #include <queue>
 
@@ -56,6 +58,7 @@ void VoiceAssistantWebSocket::loop() {
   this->wake_trigger_loop_();
   this->co_loop_();  // capture-only uploads (own client + state machine; never touches state_)
   this->wake_verdict_loop_();
+  this->heap_diag_loop_();   // heap_diag only; main loop, never the mic/websocket task
 
 #ifdef USE_NEO_INTERCOM
   // Dial only on the authenticated intercom connection, after assistant teardown.
@@ -93,6 +96,11 @@ void VoiceAssistantWebSocket::loop() {
 
   // Handle pending disconnect (must be done in main task, not websocket task)
   if (this->pending_disconnect_) {
+    // heap_diag "end": just before the session closes, if the socket is still up (main loop).
+    if (this->diag_session_open_) {
+      this->diag_session_open_ = false;
+      if (this->heap_diag_) this->heap_diag_send_("end");
+    }
     this->pending_disconnect_ = false;
     if (!this->disconnect_websocket_()) {
       this->pending_disconnect_ = true;
@@ -153,11 +161,13 @@ void VoiceAssistantWebSocket::loop() {
     if (this->server_ready_pending_.exchange(false)) {
       this->audio_transport_ready_ = true;
       ESP_LOGI(TAG, "Server ready; microphone uplink released");
+      this->heap_diag_session_start_();
     } else if (this->running_since_ > 0 &&
                (millis() - this->running_since_) > SERVER_READY_FALLBACK_MS) {
       this->audio_transport_ready_ = true;
       ESP_LOGW(TAG, "No server hello after %u ms; releasing microphone uplink for compatibility",
                SERVER_READY_FALLBACK_MS);
+      this->heap_diag_session_start_();
     }
   }
   
@@ -259,6 +269,56 @@ void VoiceAssistantWebSocket::loop() {
   
   // Audio output is handled directly in process_received_audio_()
   // No queue processing needed here
+}
+
+// ---- Heap diagnostics (development, heap_diag: true) ---------------------------------------------
+// INVARIANT: runs on the main loop only. Allocation-free (stack buffer).
+void VoiceAssistantWebSocket::heap_diag_session_start_() {
+  if (!this->heap_diag_) return;
+  this->diag_session_open_ = true;
+  this->diag_verbose_done_ = false;
+  this->diag_audio_pending_ = false;
+  this->diag_last_tick_ = millis();
+  this->heap_diag_send_("start");
+}
+
+void VoiceAssistantWebSocket::heap_diag_loop_() {
+  if (!this->heap_diag_) return;
+  if (!this->diag_session_open_) {
+    this->diag_audio_pending_ = false;
+    return;
+  }
+  if (this->state_ != VOICE_ASSISTANT_WEBSOCKET_RUNNING) return;
+  if (this->diag_audio_pending_.exchange(false)) this->heap_diag_send_("audio");
+  if ((millis() - this->diag_last_tick_) >= 2000) {
+    this->diag_last_tick_ = millis();
+    this->heap_diag_send_("tick");
+  }
+}
+
+void VoiceAssistantWebSocket::heap_diag_send_(const char *ev) {
+  const int64_t t0 = esp_timer_get_time();
+  const bool ok = heap_caps_check_integrity_all(false);
+  const uint32_t us = (uint32_t) (esp_timer_get_time() - t0);
+  if (!ok && !this->diag_verbose_done_) {
+    this->diag_verbose_done_ = true;
+    ESP_LOGE(TAG, "HEAP CORRUPTION detected (ev=%s); printing corrupt blocks", ev);
+    heap_caps_check_integrity_all(true);
+  }
+  char buf[200];
+  const int n = heap_diag_format(
+      buf, sizeof(buf), ev, (uint32_t) (esp_timer_get_time() / 1000000), (int) esp_reset_reason(),
+      (uint32_t) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+      (uint32_t) heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+      (uint32_t) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+      (uint32_t) heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+      (uint32_t) heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM), ok ? 1 : 0, us);
+  if (n <= 0 || n >= (int) sizeof(buf)) return;
+  if (!this->is_connected() || this->websocket_client_ == nullptr) return;
+  if (esp_websocket_client_send_text(this->websocket_client_, buf, n, pdMS_TO_TICKS(50)) < 0)
+    ESP_LOGW(TAG, "diag frame send failed (ev=%s)", ev);
+  else
+    ESP_LOGD(TAG, "diag %s ok=%d us=%u", ev, ok ? 1 : 0, (unsigned) us);
 }
 
 void VoiceAssistantWebSocket::dump_config() {
@@ -591,6 +651,11 @@ void VoiceAssistantWebSocket::process_received_audio_(const uint8_t *data, size_
   // FIFO through the PSRAM ring: append the new audio, then drain as much as the speaker will
   // accept. Strict order (never plays new bytes ahead of buffered backlog) with ZERO per-chunk
   // heap allocation — this is the fix for the long-playback (read-a-book) OOM crash.
+  if (this->heap_diag_) {
+    // First chunk of a reply: none yet this session, or none for >1.5 s (interrupt() zeroes the stamp).
+    const uint32_t prev = this->last_speaker_audio_time_;
+    if (prev == 0 || (millis() - prev) > 1500) this->diag_audio_pending_ = true;
+  }
   this->last_speaker_audio_time_ = millis();
   // Latched for the whole session (see turn_has_no_reply_audio()). NOT derived from the timestamp
   // above, which interrupt() zeroes on every barge-in.
@@ -1139,7 +1204,7 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   for (size_t i = 0; i < stereo_32bit_samples; i++) {
     const int32_t sample = stereo_32bit[i * 2 + channel];
     mono_16bit[i] = wake_tap ? wake_capture_sample(sample, this->enrollment_wake_gain_factor_)
-                           : static_cast<int16_t>(sample >> 16);
+                           : uplink_sample(sample, this->uplink_gain_factor_);
   }
   
   // Resample from 16kHz to 24kHz (1.5x upsampling)
