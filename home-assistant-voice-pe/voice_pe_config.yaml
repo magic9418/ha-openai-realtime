@@ -34,7 +34,7 @@ substitutions:
   # at /satellite1 so '../../satellite1' resolves (natively it is firmware/voice-pe/home-assistant-voice-pe/../../satellite1);
   # run verify_shared_components.py first. The sibling must be content-identical to the lock.
   # F1a = intermediate consolidated build (NOT FOR FLASH): talkover5 + review fixes + shared components.
-  esp32_fw_version: neo-2026.11.22-office-f1a
+  esp32_fw_version: neo-2026.11.23-office-f1
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'

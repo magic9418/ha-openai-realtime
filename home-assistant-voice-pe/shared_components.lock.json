@@ -1,15 +1,15 @@
 {
   "consumer_base_commit": "cdfc241",
-  "source_base_commit": "fbb2daf",
+  "source_base_commit": "3c65faa",
   "source_path": "../../satellite1/esphome/components",
   "components": {
     "fusb302b": "23056b5578a2c9a9947cc1ea5352a1c6f3b513dce38d85c306d9483da7bfc5ac",
-    "neo_intercom": "c70e44aae9a94e804ee9138c4a5799279e8058b1ec524a75b0646b4032a58918",
-    "satellite1": "8aed926c125a5a353e5280ef5c9dfbca262968e502ca85c8aebd5dea91909fb6",
+    "neo_intercom": "f6cf01cc90f86c174903ec739a1d99a04ef8964d261dbb6c775451d237b1132c",
+    "satellite1": "04bcbd65e0b4dbda6d8924792b1c43e84280f09c6d3366f024122e882b27e636",
     "tas2780": "d1d26c748a79c73be84aaa392ba1dca6daf2abdb0359884c9421b8be16316196"
   },
   "identical_local_components": {
     "micro_wake_word": "4f59fc1e5b87b7e93ba73bf56be2e3a8b34e8a4485409879bd36d80b83c9c760",
-    "voice_assistant_websocket": "0f9f6127ee75bb20d4945065c62831b4fdde85a995ae4e143cb5ac0b15e5beef"
+    "voice_assistant_websocket": "e0bfe9e9953c11932b85a827961978283cd71aa313d747815614661d734143cb"
   }
 }
