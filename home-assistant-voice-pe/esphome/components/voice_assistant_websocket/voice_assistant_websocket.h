@@ -319,6 +319,7 @@ class VoiceAssistantWebSocket : public Component {
   // buffering is bounded no matter how long the reply. Enabled only when the server's hello carries
   // "flow_control":"credit" (old servers → stays open-loop, server time-paces as before).
   bool flow_control_enabled_{false};
+  bool audio_free_resend_{false};        // last audio_free send was dropped: re-report on the next call
   size_t audio_free_reported_fill_{0};   // ring fill at the last report (hysteresis reference)
   static const size_t AUDIO_FREE_REPORT_QUANTUM = AUDIO_RING_CAPACITY / 4;  // report every ~0.5s drained/filled
   void report_audio_free_(bool force);   // send {"type":"audio_free","bytes":<capacity-fill>}

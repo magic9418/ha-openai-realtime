@@ -155,12 +155,25 @@ esp32:
       # block, so a heap overrun is NAMED when detected (heap_caps_check_integrity_all, free) instead
       # of corrupting the free list silently (the talkover2 StoreProhibited in tlsf_malloc). Costs a
       # few bytes per allocation; remove once the crash is found.
+      #
+      # TODO(F1 soak): TURN OFF after an on-device soak shows > 50 KB internal DRAM free (see the
+      # `[diag]` heap lines). It is a ONE-LINE change: delete this key (or set it to "n"). Matching
+      # switch: `heap_diag: true` on voice_assistant_websocket below. Both stay ON for the first F1 flash.
       CONFIG_HEAP_POISONING_LIGHT: "y"
       # talkover5: reclaim internal RAM (idle free was ~13 KB after one session). WiFi static RX buffers
       # are internal RAM, ~1.6 KB each: 16 -> 8 frees ~13 KB. RX BA window kept <= 2x the static count
       # (it was 32). DYNAMIC_RX, TCP window and TX settings are deliberately untouched.
       CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM: "8"
       CONFIG_ESP_WIFI_RX_BA_WIN: "16"
+      # F1 internal-RAM fix. ESPHome's psram component selects SPIRAM_USE_CAPS_ALLOC, so plain malloc()
+      # never touches PSRAM and every library allocation eats internal DRAM. Switch to the malloc-capable
+      # PSRAM mode: allocations <= 64 B stay internal (ALWAYSINTERNAL), larger ones go to PSRAM, and
+      # DMA/ISR users keep asking for MALLOC_CAP_INTERNAL explicitly. WiFi/LWIP buffers try PSRAM first.
+      # Does NOT touch the talkover5 WiFi static RX buffer count above (8 static, BA window 16): those
+      # are static internal buffers; TRY_ALLOCATE_WIFI_LWIP only moves the *dynamic* WiFi/LWIP allocs.
+      CONFIG_SPIRAM_USE_MALLOC: "y"
+      CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL: "64"
+      CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP: "y"
 
 wifi:
   id: wifi_id
@@ -183,6 +196,8 @@ wifi:
 network:
 
 logger:
+  # F1 soak: DEBUG is DELIBERATE (the on-device soak needs the [diag]/heap and talk-over detail). Drop to INFO
+  # (as Sat1 already is) in the clean-up build once the soak is done.
   level: DEBUG
   logs:
     sensor: WARN
@@ -1112,6 +1127,12 @@ speaker:
       - id: media_mixing_input
         timeout: never
   
+  # NOTE (F1): voice_resampling_speaker and announcement_resampling_speaker are deliberately NOT merged.
+  # neo_intercom takes them as separate announcement_resampler / media_resampler and reserves/quiesces both
+  # independently (set_output_reservation + output_reservation_quiescent); the media player's announcement
+  # pipeline start/stops one while voice_assistant_websocket streams TTS into the other. Merging would
+  # make the shared stream stop under the TTS. Their task stacks are already in PSRAM, so the internal-RAM
+  # saving would be tiny.
   # Resampler for voice assistant announcements (24kHz -> 48kHz)
   - platform: resampler
     id: announcement_resampling_speaker
@@ -1150,6 +1171,10 @@ media_source:
     task_stack_in_psram: true   # talkover4: internal RAM is exhausted (websocket task create failed at ~13 KB free); stack lives in PSRAM
   - platform: sendspin
     id: sendspin_media_source
+    # F1 internal-RAM fix: keep the Sendspin decode task stack and decoder/sync buffers out of
+    # internal DRAM (idle free was ~13 KB). Both options exist in ESPHome 2026.6.5's media_source.
+    task_stack_in_psram: true
+    decode_memory: psram
 
 # Media Player for voice assistant audio output (like original HA Voice)
 media_player:
@@ -1419,6 +1444,8 @@ voice_assistant_websocket:
   uplink_gain_factor: 64
   # DEVELOPMENT: report heap stats + integrity check to the server as {"type":"diag",...} frames
   # (start / audio / tick every 2 s / end). Main loop only. See wakeword/builds/2026-11-14/README.md.
+  # TODO(F1 soak): set to false (one line) together with CONFIG_HEAP_POISONING_LIGHT above, once an
+  # on-device soak shows > 50 KB internal DRAM free. Kept ON for the first F1 flash on purpose.
   heap_diag: true
   # talkover4: the persistent uplink sender task's 4 KB stack lives in PSRAM (falls back to internal RAM).
   task_stack_in_psram: true
@@ -1640,6 +1667,7 @@ time:
   # `timezone:` string here if the 04:00 firing time turns out wrong.
   - platform: sntp
     id: ha_time
+    timezone: "America/New_York"
     on_time:
       # 04:00 local: reboot to clear heap, but only if no voice session is open.
       - seconds: 0
@@ -1648,9 +1676,14 @@ time:
         then:
           - if:
               condition:
-                not:
-                  voice_assistant_websocket.is_running:
-                    id: voice_assistant_ws
+                and:
+                  - not:
+                      voice_assistant_websocket.is_running:
+                        id: voice_assistant_ws
+                  # Never reboot out from under a live intercom call / drop-in.
+                  - not:
+                      neo_intercom.is_active:
+                        id: pe_intercom
               then:
                 - logger.log:
                     format: "Nightly auto-reboot (04:00 idle) — clearing heap fragmentation"

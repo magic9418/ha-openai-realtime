@@ -1232,18 +1232,25 @@ void VoiceAssistantWebSocket::report_audio_free_(bool force) {
   const size_t fill = this->audio_ring_fill_;
   const size_t delta = (fill > this->audio_free_reported_fill_) ? fill - this->audio_free_reported_fill_
                                                                 : this->audio_free_reported_fill_ - fill;
-  const bool report = force || delta >= AUDIO_FREE_REPORT_QUANTUM;
-  if (report) {
-    this->audio_free_reported_fill_ = fill;
-    free_bytes = AUDIO_RING_CAPACITY - fill;
-  }
+  const bool report = force || this->audio_free_resend_ || delta >= AUDIO_FREE_REPORT_QUANTUM;
+  if (report) free_bytes = AUDIO_RING_CAPACITY - fill;
   if (this->audio_ring_lock_ != nullptr) xSemaphoreGive(this->audio_ring_lock_);
   if (!report) return;
   char buf[64];
   snprintf(buf, sizeof(buf), "{\"type\":\"audio_free\",\"bytes\":%zu}", free_bytes);
-  // BOUNDED: audio_ring_drain_() calls this from the MAIN LOOP. Safe to drop - the report is
-  // absolute (capacity - fill), not a delta, so the next one self-corrects.
-  this->send_text_frame_(buf, pdMS_TO_TICKS(50));
+  // BOUNDED: audio_ring_drain_() calls this from the MAIN LOOP, so the send can time out and DROP the
+  // frame. The reference fill is therefore advanced ONLY after the send succeeded: a dropped credit
+  // leaves audio_free_reported_fill_ stale, the hysteresis delta stays >= QUANTUM, and the very next
+  // drain/push re-reports (long TTS playback must never stall on a lost credit).
+  const bool sent_ok = this->send_text_frame_(buf, pdMS_TO_TICKS(50));
+  if (this->audio_ring_lock_ != nullptr) xSemaphoreTake(this->audio_ring_lock_, portMAX_DELAY);
+  if (sent_ok) {
+    this->audio_free_reported_fill_ = fill;
+    this->audio_free_resend_ = false;
+  } else {
+    this->audio_free_resend_ = true;   // even a forced report with unchanged fill is retried next call
+  }
+  if (this->audio_ring_lock_ != nullptr) xSemaphoreGive(this->audio_ring_lock_);
 }
 
 void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &data) {
@@ -1609,7 +1616,8 @@ void VoiceAssistantWebSocket::send_false_flag() {
   // the server relabels the newest wake probe as a hard negative for retraining.
   ESP_LOGI(TAG, "false_flag: user marked the last wake as a false trigger");
   // BOUNDED: driven by a YAML button automation, i.e. the main loop (finding 7).
-  this->send_text_frame_("{\"type\":\"false_flag\"}", pdMS_TO_TICKS(50));
+  if (!this->send_text_frame_("{\"type\":\"false_flag\"}", pdMS_TO_TICKS(50)))
+    this->send_text_frame_("{\"type\":\"false_flag\"}", pdMS_TO_TICKS(50));  // one retry: a user action must not vanish
 }
 
 void VoiceAssistantWebSocket::send_button_cancel() {
@@ -1622,7 +1630,8 @@ void VoiceAssistantWebSocket::send_button_cancel() {
   }
   ESP_LOGI(TAG, "button_cancel: fast cancel after wake with no reply audio yet");
   // BOUNDED: driven by a YAML button automation, i.e. the main loop (finding 7).
-  this->send_text_frame_("{\"type\":\"button_cancel\"}", pdMS_TO_TICKS(50));
+  if (!this->send_text_frame_("{\"type\":\"button_cancel\"}", pdMS_TO_TICKS(50)))
+    this->send_text_frame_("{\"type\":\"button_cancel\"}", pdMS_TO_TICKS(50));  // one retry: a user action must not vanish
 }
 
 void VoiceAssistantWebSocket::enter_enrollment_(bool wake_tap) {
