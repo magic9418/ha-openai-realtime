@@ -23,6 +23,11 @@ static const ssize_t DETECTION_QUEUE_LENGTH = 5;
 
 static const size_t DATA_TIMEOUT_MS = 50;
 
+// 1 Hz [neo-raw] / [neo-mic] debug scans run on the inference task; off unless a build defines NEO_MWW_DIAG=1.
+#ifndef NEO_MWW_DIAG
+#define NEO_MWW_DIAG 0
+#endif
+
 static const uint32_t RING_BUFFER_DURATION_MS = 120;
 
 #ifdef CONFIG_IDF_TARGET_ESP32P4
@@ -30,8 +35,8 @@ static const uint32_t RING_BUFFER_DURATION_MS = 120;
 // significantly more stack than other variants, causing stack protection faults at 3072.
 static const uint32_t INFERENCE_TASK_STACK_SIZE = 8192;
 #else
-// NEO: 4096 (was 3072): stage 2 adds a second interpreter invoke (same kernels, one extra call frame) on this task.
-static const uint32_t INFERENCE_TASK_STACK_SIZE = 4096;
+// NEO: 5120 (was 3072; 4096 on the first stage-2 builds): stage 2 adds a second interpreter invoke (same kernels, one extra call frame) on this task.
+static const uint32_t INFERENCE_TASK_STACK_SIZE = 5120;
 #endif
 static const UBaseType_t INFERENCE_TASK_PRIORITY = 3;
 
@@ -198,6 +203,15 @@ void MicroWakeWord::inference_task(void *params) {
         if (xEventGroupGetBits(this_mww->event_group_) & EventGroupBits::COMMAND_RESET_RING_BUFFER) {
           // Producer asked us to drain; run the consumer-side reset from this thread.
           audio_source->clear_buffered_data();
+          // The audio gap invalidates everything derived from the audio before it: the microfrontend's
+          // internal sample/noise state, the half-filled model input stride, the rolling probabilities
+          // and the stage-2 feature history. Reset them all so no window straddles the gap.
+          FrontendReset(&this_mww->frontend_state_);
+          for (auto &m : this_mww->wake_word_models_) m->reset_stream_state();
+#ifdef USE_MICRO_WAKE_WORD_VAD
+          this_mww->vad_model_->reset_stream_state();
+#endif
+          this_mww->history_.reset();
           xEventGroupClearBits(this_mww->event_group_, EventGroupBits::COMMAND_RESET_RING_BUFFER);
         }
 
@@ -209,6 +223,37 @@ void MicroWakeWord::inference_task(void *params) {
         while (audio_source->available() >= sizeof(int16_t)) {
           const size_t samples_available = audio_source->available() / sizeof(int16_t);
           const int16_t *audio_data = reinterpret_cast<const int16_t *>(audio_source->data());
+
+          // NEO DIAG raw-audio liveness (music-assistant-stage-a) — build-independent of the model
+          // and of the XMOS noise-suppression that floors a silent room to a constant model output.
+          // Throttled ~1/s scan of the mic buffer: min/max/mean-abs, plus a FROZEN flag (every
+          // sample equals the first). Discriminates true silence (min=max=0) vs a live noise floor
+          // (small, moving) vs a frozen/DC/stale i2s buffer (nonzero & all-equal) with NO sound.
+#if NEO_MWW_DIAG
+          if (samples_available > 0) {
+            static uint32_t neo_raw_last = 0;
+            const uint32_t neo_raw_now = millis();
+            if (neo_raw_now - neo_raw_last >= 1000) {
+              neo_raw_last = neo_raw_now;
+              int16_t mn = audio_data[0], mx = audio_data[0];
+              int64_t sabs = 0;
+              bool frozen = true;
+              for (size_t i = 0; i < samples_available; i++) {
+                const int16_t v = audio_data[i];
+                if (v < mn)
+                  mn = v;
+                if (v > mx)
+                  mx = v;
+                sabs += (v < 0) ? -v : v;
+                if (v != audio_data[0])
+                  frozen = false;
+              }
+              ESP_LOGD(TAG, "[neo-raw] n=%u first=%d min=%d max=%d meanabs=%d frozen=%d",
+                       (unsigned) samples_available, (int) audio_data[0], (int) mn, (int) mx,
+                       (int) (sabs / (int64_t) samples_available), (int) frozen);
+            }
+          }
+#endif  // NEO_MWW_DIAG
 
           size_t processed_samples = 0;
           const bool feature_generated =
@@ -491,22 +536,57 @@ void MicroWakeWord::process_probabilities_() {
     if (model->get_unprocessed_probability_status()) {
       // Only detect wake words if there is a new probability since the last check
       DetectionEvent wake_word_state = model->determine_detected();
+
+      // NEO DIAG (objective mic-health signal, music-assistant-stage-a): throttled per-model
+      // probability readout, ~1/s, printed EVEN WHEN BELOW CUTOFF. This runs on the inference task
+      // only while it is actually consuming mic audio, so it distinguishes every failure mode:
+      //   * log ABSENT           -> inference task not fed -> mic ring buffer empty -> i2s not
+      //                             delivering samples (XMOS clock dead / mic consumer not started).
+      //   * max/avg PINNED FLAT  -> mic delivering constant/zero audio (i2s clocking but silent).
+      //   * max/avg FLUCTUATING  -> mic HEALTHY (even a quiet room has a moving noise floor).
+      //   * infers/s LOW         -> inference task starved of CPU (task-contention hypothesis).
+      // Cheap (one throttled ESP_LOGD, no alloc). Remove once the sendspin mic failure is settled.
+#if NEO_MWW_DIAG
+      static uint32_t neo_diag_last_ms = 0;
+      static uint32_t neo_diag_infers = 0;
+      neo_diag_infers++;
+      const uint32_t neo_diag_now = millis();
+      if (neo_diag_now - neo_diag_last_ms >= 1000) {
+#ifdef USE_MICRO_WAKE_WORD_VAD
+        ESP_LOGD(TAG, "[neo-mic] '%s' max=%u avg=%u cutoff=%u vad_max=%u vad=%d infers/s=%u",
+                 model->get_wake_word().c_str(), wake_word_state.max_probability,
+                 wake_word_state.average_probability, model->get_probability_cutoff(),
+                 vad_state.max_probability, (int) vad_state.detected, neo_diag_infers);
+#else
+        ESP_LOGD(TAG, "[neo-mic] '%s' max=%u avg=%u cutoff=%u infers/s=%u",
+                 model->get_wake_word().c_str(), wake_word_state.max_probability,
+                 wake_word_state.average_probability, model->get_probability_cutoff(),
+                 neo_diag_infers);
+#endif
+        neo_diag_last_ms = neo_diag_now;
+        neo_diag_infers = 0;
+      }
+#endif  // NEO_MWW_DIAG
+
       if (wake_word_state.detected) {
 #ifdef USE_MICRO_WAKE_WORD_VAD
         if (vad_state.detected) {
 #endif
           // NEO stage 2: score THIS detection now (inference task, the firing invocation's last frame).
           wake_word_state.stage2 = this->stage2_.evaluate(this->history_.frames_written() - 1);
-          xQueueSend(this->detection_queue_, &wake_word_state, portMAX_DELAY);
+          const bool queued = xQueueSend(this->detection_queue_, &wake_word_state, 0) == pdTRUE;
 
           // Wake main loop immediately to process wake word detection
           App.wake_loop_threadsafe();
 
-          model->reset_probabilities();
+          // Never block inference behind a stalled main loop. If the queue was
+          // full, keep the detection eligible so a later output can retry.
+          if (queued) model->reset_probabilities();
 #ifdef USE_MICRO_WAKE_WORD_VAD
         } else {
           wake_word_state.blocked_by_vad = true;
-          xQueueSend(this->detection_queue_, &wake_word_state, portMAX_DELAY);
+          // VAD rejection is diagnostic; losing it must not stall inference.
+          xQueueSend(this->detection_queue_, &wake_word_state, 0);
         }
 #endif
       }

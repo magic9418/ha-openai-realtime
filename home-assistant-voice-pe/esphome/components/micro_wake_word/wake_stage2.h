@@ -74,6 +74,7 @@ class Stage2Runner {
   std::string model_id_;
   bool configured_{false};
   bool ready_{false};
+  std::atomic<uint16_t> stack_hwm_words_{0};  // inference task stack high-water (words), report only
   const char *status_{"notconfigured"};
   uint8_t default_mode_{STAGE2_SHADOW};
   uint8_t default_threshold_{0};

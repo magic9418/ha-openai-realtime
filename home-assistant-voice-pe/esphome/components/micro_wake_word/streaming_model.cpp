@@ -202,6 +202,11 @@ bool StreamingModel::perform_streaming_inference(const int8_t features[PREPROCES
   }
 
   if (this->loaded_) {
+    // Cutoff requests originate on the main loop, but the inference task owns the
+    // rolling probabilities and duplicate-detection cooldown. Apply the request
+    // here so the window is cleared without racing either consumer.
+    this->apply_pending_probability_cutoff_();
+
     TfLiteTensor *input = this->interpreter_->input(0);
 
     uint8_t stride = this->interpreter_->input(0)->dims->data[1];
@@ -239,10 +244,34 @@ bool StreamingModel::perform_streaming_inference(const int8_t features[PREPROCES
 }
 
 void StreamingModel::reset_probabilities() {
+  this->clear_probability_window_();
+  this->ignore_windows_ = -MIN_SLICES_BEFORE_DETECTION;
+}
+
+void StreamingModel::apply_pending_probability_cutoff_() {
+  const uint16_t pending = this->pending_probability_cutoff_.exchange(256, std::memory_order_acq_rel);
+  if (pending == 256) {
+    return;
+  }
+
+  const uint8_t cutoff = static_cast<uint8_t>(pending);
+  if (cutoff == this->probability_cutoff_) {
+    return;
+  }
+
+  this->probability_cutoff_ = cutoff;
+  // A cutoff transition must not score samples collected under the previous
+  // regime. Keep ignore_windows_ unchanged: it is the real post-detection
+  // cooldown and must not be restarted by a sensitivity change.
+  this->clear_probability_window_();
+}
+
+void StreamingModel::clear_probability_window_() {
   for (auto &prob : this->recent_streaming_probabilities_) {
     prob = 0;
   }
-  this->ignore_windows_ = -MIN_SLICES_BEFORE_DETECTION;
+  this->last_n_index_ = 0;
+  this->unprocessed_probability_status_ = false;
 }
 
 WakeWordModel::WakeWordModel(const std::string &id, const uint8_t *model_start, uint8_t default_probability_cutoff,

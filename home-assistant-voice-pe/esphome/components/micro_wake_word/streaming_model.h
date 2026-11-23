@@ -7,6 +7,8 @@
 
 #include "esphome/core/preferences.h"
 
+#include <atomic>
+
 #include <tensorflow/lite/core/c/common.h>
 #include <tensorflow/lite/micro/micro_interpreter.h>
 #include <tensorflow/lite/micro/micro_mutable_op_resolver.h>
@@ -40,6 +42,12 @@ class StreamingModel {
 
   /// @brief Sets all recent_streaming_probabilities to 0 and resets the ignore window count
   void reset_probabilities();
+  /// @brief Ring-buffer overflow recovery: reset_probabilities() plus restart the stride position, so the
+  /// next feature frames are not stitched onto a half-filled input tensor from before the gap.
+  void reset_stream_state() {
+    this->reset_probabilities();
+    this->current_stride_step_ = 0;
+  }
 
   /// @brief Destroys the TFLite interpreter and frees the tensor and variable arenas' memory
   void unload_model();
@@ -62,7 +70,12 @@ class StreamingModel {
   // Quantized probability cutoffs mapping 0.0 - 1.0 to 0 - 255
   uint8_t get_default_probability_cutoff() const { return this->default_probability_cutoff_; }
   uint8_t get_probability_cutoff() const { return this->probability_cutoff_; }
-  void set_probability_cutoff(uint8_t probability_cutoff) { this->probability_cutoff_ = probability_cutoff; }
+  /// @brief Queue a cutoff change for the inference task to apply safely.
+  void request_probability_cutoff(uint8_t probability_cutoff) {
+    this->pending_probability_cutoff_.store(probability_cutoff, std::memory_order_release);
+  }
+  // Preserve the existing setter API while keeping cutoff transitions on the inference task.
+  void set_probability_cutoff(uint8_t probability_cutoff) { this->request_probability_cutoff(probability_cutoff); }
 
  protected:
   /// @brief Allocates tensor and variable arenas and sets up the model interpreter
@@ -74,6 +87,8 @@ class StreamingModel {
   size_t probe_arena_size_();
   /// @brief Returns true if successfully registered the streaming model's TensorFlow operations
   bool register_streaming_ops_(tflite::MicroMutableOpResolver<20> &op_resolver);
+  void apply_pending_probability_cutoff_();
+  void clear_probability_window_();
 
   tflite::MicroMutableOpResolver<20> streaming_op_resolver_;
 
@@ -88,6 +103,8 @@ class StreamingModel {
 
   uint8_t default_probability_cutoff_;
   uint8_t probability_cutoff_;
+  // 256 means no update is pending; all valid cutoffs fit in uint8_t.
+  std::atomic<uint16_t> pending_probability_cutoff_{256};
   size_t sliding_window_size_;
 
   size_t last_n_index_{0};

@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Fail unless PE's local shared components match the reviewed content lock."""
+"""Fail unless PE's shared components match the reviewed content lock.
+
+Two groups: `components` are consumed straight from the Satellite1 checkout; and
+`identical_local_components` are PE-local copies that must be byte-identical to Satellite1's.
+"""
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 
@@ -24,7 +29,8 @@ def component_digest(root: Path, name: str) -> str:
 
 def main() -> None:
     lock = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
-    root = (HERE / lock["source_path"]).resolve()
+    # SATELLITE1_COMPONENTS overrides the sibling path (worktree layouts have no ../../satellite1).
+    root = Path(os.environ.get("SATELLITE1_COMPONENTS") or (HERE / lock["source_path"])).resolve()
     mismatches = [
         name
         for name, expected in lock["components"].items()
@@ -32,6 +38,23 @@ def main() -> None:
     ]
     if mismatches:
         raise SystemExit("shared component lock mismatch: " + ", ".join(mismatches))
+
+    # Components PE builds from its OWN copy (external_components path esphome/components) but that
+    # must stay byte-identical to the Satellite1 source. Per-device differences belong in YAML
+    # options, not in divergent text. Checked three ways: PE copy == lock, source == lock, and
+    # therefore PE copy == source.
+    local_root = HERE / "esphome" / "components"
+    drift = []
+    for name, expected in lock.get("identical_local_components", {}).items():
+        if component_digest(local_root, name) != expected:
+            drift.append(f"{name} (PE copy differs from lock)")
+        if component_digest(root, name) != expected:
+            drift.append(f"{name} (satellite1 source differs from lock)")
+    if drift:
+        raise SystemExit(
+            "shared component drift: " + ", ".join(drift)
+            + ". Make the two copies identical, then update the lock hash."
+        )
     print("shared component lock verified")
 
 

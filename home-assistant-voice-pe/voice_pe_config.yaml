@@ -32,8 +32,9 @@ substitutions:
   # Build recipe (ESPHome 2026.6.5 docker): mount this dir at /config and the sibling checkout
   # /home/matt/projects/penny/firmware/satellite1 (shared_components.lock.json, verify_shared_components.py)
   # at /satellite1 so '../../satellite1' resolves (natively it is firmware/voice-pe/home-assistant-voice-pe/../../satellite1);
-  # run verify_shared_components.py first. The sibling must be content-identical to the lock (959d4c1 components).
-  esp32_fw_version: neo-2026.11.14-office-stage2-v4-talkover5
+  # run verify_shared_components.py first. The sibling must be content-identical to the lock.
+  # F1a = intermediate consolidated build (NOT FOR FLASH): talkover5 + review fixes + shared components.
+  esp32_fw_version: neo-2026.11.22-office-f1a
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -68,6 +69,10 @@ substitutions:
   # Strict rejection remains active during playback and barge-in as well as idle.
   # Calibrated on saved clips; everyday PE recall/false-wake behavior needs observation.
   wake_word_model: wake_words/penny_v5_oct1.json
+  # NOTE (review 2026-11-10): these flat cutoffs (235/235) and window 5 DIFFER from the Satellite1's
+  # tiered 217/191/166/155 (satellite1 config/common/neo_voice.yaml). They were tuned on real
+  # devices and NOT verified as intentional vs. drift: do not "fix" them to match without a
+  # real-device A/B on this PE.
   wake_penny_cutoff_idle: "0.922"
   wake_penny_cutoff_idle_int: "235"
   wake_penny_cutoff_session_int: "235"
@@ -1195,7 +1200,7 @@ media_player:
           duration: 0.0s
     on_state:
       # NEO stage 2 regime: music playing => shadow only.
-      - lambda: id(mww).set_stage2_cold_idle(!id(voice_assistant_ws).session_active() && id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING);
+      - lambda: id(mww).set_stage2_cold_idle(!id(voice_assistant_ws).session_active() && id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING && !esphome::neo_intercom::NeoIntercom::local_call_is_active());
       - if:
           condition:
             and:
@@ -1417,6 +1422,14 @@ voice_assistant_websocket:
   heap_diag: true
   # talkover4: the persistent uplink sender task's 4 KB stack lives in PSRAM (falls back to internal RAM).
   task_stack_in_psram: true
+  # PE-specific (the component source is shared byte-for-byte with Satellite1, see
+  # shared_components.lock.json; per-device differences live in these options):
+  # 1 KiB websocket buffer: a 4 KiB one cannot be allocated while Sendspin has I2S's DMA pool.
+  # Chunked frames are reassembled in the component, so this only means more chunks.
+  websocket_buffer_size: 1024
+  # Compiled default until the server's `hello` supplies the real value. 0 = no gate: both devices wake
+  # silently, and a non-zero delay splices the look-back across a gap.
+  wake_open_delay_ms: 0ms
   wake_trigger_model: ${wake_word_model}
   wake_trigger_window: ${wake_penny_window}
   wake_trigger_fw: ${esp32_fw_version}
@@ -1455,7 +1468,7 @@ voice_assistant_websocket:
     # lower rejection of background conversation with this model.
     - lambda: id(primary_wake_word).set_probability_cutoff(${wake_penny_cutoff_session_int});
     # NEO stage 2 regime: enforcement only for a cold idle wake (no session, no music).
-    - lambda: id(mww).set_stage2_cold_idle(!id(voice_assistant_ws).session_active() && id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING);
+    - lambda: id(mww).set_stage2_cold_idle(!id(voice_assistant_ws).session_active() && id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING && !esphome::neo_intercom::NeoIntercom::local_call_is_active());
   on_disconnected:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # turn ended → idle (ring off), NOT not_ready (red). Red is reserved for WiFi-down.
     - script.execute: control_leds
@@ -1469,7 +1482,7 @@ voice_assistant_websocket:
         duration: 1.0s
     - lambda: id(primary_wake_word).set_probability_cutoff(${wake_penny_cutoff_idle_int});   # back to strict idle
     # NEO stage 2 regime: enforcement only for a cold idle wake (no session, no music).
-    - lambda: id(mww).set_stage2_cold_idle(!id(voice_assistant_ws).session_active() && id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING);
+    - lambda: id(mww).set_stage2_cold_idle(!id(voice_assistant_ws).session_active() && id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING && !esphome::neo_intercom::NeoIntercom::local_call_is_active());
   on_stopped:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # turn ended → idle (ring off), NOT not_ready (red). Red is reserved for WiFi-down.
     - script.execute: control_leds
@@ -1480,7 +1493,7 @@ voice_assistant_websocket:
         duration: 1.0s
     - lambda: id(primary_wake_word).set_probability_cutoff(${wake_penny_cutoff_idle_int});   # back to strict idle
     # NEO stage 2 regime: enforcement only for a cold idle wake (no session, no music).
-    - lambda: id(mww).set_stage2_cold_idle(!id(voice_assistant_ws).session_active() && id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING);
+    - lambda: id(mww).set_stage2_cold_idle(!id(voice_assistant_ws).session_active() && id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING && !esphome::neo_intercom::NeoIntercom::local_call_is_active());
   on_error:
     - if:
         condition:
@@ -1497,7 +1510,7 @@ voice_assistant_websocket:
     # false-wakes on ambience forever, so restore it on every error path without exception.
     - lambda: id(primary_wake_word).set_probability_cutoff(${wake_penny_cutoff_idle_int});   # back to strict idle
     # NEO stage 2 regime: enforcement only for a cold idle wake (no session, no music).
-    - lambda: id(mww).set_stage2_cold_idle(!id(voice_assistant_ws).session_active() && id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING);
+    - lambda: id(mww).set_stage2_cold_idle(!id(voice_assistant_ws).session_active() && id(voice_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING && !esphome::neo_intercom::NeoIntercom::local_call_is_active());
   # Wake-word enrollment mode (docs/wakeword_flywheel_plan.md Phase 3). The C++ owns the
   # mic-pin + 15-min safety cap + WS-drop restore; the YAML just disarms/re-arms the wake
   # model so guided reps ("Penny, Penny, Penny...") don't self-trigger while streaming.

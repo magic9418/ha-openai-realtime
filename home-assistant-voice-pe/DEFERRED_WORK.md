@@ -134,3 +134,22 @@ on top of it (they were never the problem).
   base first (flash a known-good old bin, or rebuild a clean pre-flywheel commit with a pinned
   toolchain + reduced RAM pressure), THEN re-apply the firmware fixes above one at a time,
   flashing + checking the device log between each.
+
+## 2026-10-09: v13 (endfix) rolled back to v12 on the office PE
+
+Symptom: after the v13 flash, "Connect me to the kitchen" / "Drop into the kitchen" closed the voice
+session from the PE side after ~3.6 s (0 tools), blue LEDs went off, PE flashed red. Pilot log:
+`ended call; reason=ownership_lost`, then `readiness received; type=chime_ready` ->
+`RuntimeDenied reason=stale readiness`, then a `TimeoutError` control reconnect every ~18 s.
+PE runtime status (one bounded pull): `state=ending` permanently (minutes), control socket flapping
+connected 0/1, and NO `ENDING stuck` / `ENDING watchdog` warnings at all - i.e. the v13 force-release
+never engaged, so v13 did not fix the wedge. These were the first PE-sourced call attempts since the flash,
+so the call itself failed during setup (end_call_("ownership_lost") fires from RESERVING/PREPARING/CHIMING:
+amp denied, output unavailable before chime, chime start rejected, or chime receipt epoch mismatch) and
+the endpoint then never left ENDING.
+Recovery: restored the v12 registry approval (backup kitchen-pilot.json.bak.20261008T233025Z), restarted
+the pilot, OTA'd pe-dropin-trainprep-v12.ota.bin; PE `state=idle`, office-voice-pe + kitchen available=True.
+Pre-rollback registry saved as kitchen-pilot.json.bak.v13-before-rollback.20261009.
+OPEN: root cause of the failed first call setup (needs one bounded PE log pull DURING a spoken drop-in) and
+why ENDING is not left when `output_release_pending_` watchdog logging never prints (suspect another early
+`return` in NeoIntercom::loop(), or ENDING reached with output_release_pending_ false). Do not re-flash v13.

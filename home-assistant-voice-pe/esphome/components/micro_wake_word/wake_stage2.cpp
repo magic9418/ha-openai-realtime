@@ -29,9 +29,9 @@ struct Stage2Pref {
   uint8_t pad;
 };
 static const uint8_t PREF_MAGIC = 0xA5;
-// Below this much free stack (words) at the firing invocation, stage 2 is skipped (fail-open) rather than risking
-// an overflow of the 4 KB inference task stack.
-static const UBaseType_t MIN_STACK_HEADROOM_WORDS = 384;  // 1536 B
+// The inference task stack high-water mark is a LIFETIME minimum: one transient dip would latch any check on it
+// forever. It is therefore reported only (log_summary_), never used to gate stage 2. The task stack is sized
+// (INFERENCE_TASK_STACK_SIZE in micro_wake_word.cpp) to leave ample headroom for the extra stage-2 Invoke frame.
 static const uint32_t COUNTERS_LOG_INTERVAL_MS = 60000;
 // The self-test only catches GROSS failure (wrong model, corrupt flash, stuck/garbage output). ESP-NN's optimised
 // kernels differ from the TFLM reference by a few LSB on these extreme synthetic inputs (measured on the ESP32-S3:
@@ -151,6 +151,7 @@ void Stage2Runner::setup(FeatureHistory *history) {
   const bool ok = this->selftest_();
   this->ready_ = ok;
   this->status_ = ok ? "ok" : "selftest_fail";
+  if (!ok) this->release_();  // frees the arena (128 KB PSRAM by default); evaluate() fails open on !ready_
   ESP_LOGI(TAG, "stage2 %s: model=%s arena used %u of %u B (PSRAM) mode=%s threshold=%u (default %u)",
            ok ? "ready" : "FORCED OFF", this->model_id_.c_str(), (unsigned) this->arena_used_,
            (unsigned) this->arena_actual_, mode_name(this->mode()), (unsigned) this->threshold(),
@@ -191,11 +192,10 @@ Stage2Result Stage2Runner::evaluate(uint32_t fire_frame) {
   const uint8_t mode = this->mode();
   r.mode = mode;
   r.threshold = this->threshold();
-  if (mode == STAGE2_OFF || this->interpreter_ == nullptr) return r;  // valid=false: pass
-  if (uxTaskGetStackHighWaterMark(nullptr) < MIN_STACK_HEADROOM_WORDS) {
-    this->n_skipped_.fetch_add(1);
-    return r;
-  }
+  if (!this->ready_) return r;  // not set up / self-test failed / released: fail open (valid=false: pass)
+  if (mode == STAGE2_OFF || this->interpreter_ == nullptr) return r;
+  // Reporting only (lifetime minimum, in words); never gates stage 2.
+  this->stack_hwm_words_.store(static_cast<uint16_t>(uxTaskGetStackHighWaterMark(nullptr)), std::memory_order_relaxed);
   TfLiteTensor *in = this->interpreter_->input(0);
   if (!this->history_->copy_last(fire_frame, STAGE2_WINDOW_FRAMES, in->data.int8)) {
     this->n_errors_.fetch_add(1);
@@ -229,14 +229,15 @@ void Stage2Runner::log_summary_(const char *prefix, uint32_t frames_total, uint3
   ESP_LOGI(TAG,
            "%s mode=%s thr=%u status=%s selftest=%s arena=%u/%u B(PSRAM) setup_free_psram=%u setup_free_int=%u "
            "frames=%u stage1_infers=%u det=%u pass=%u rej=%u shadow_would_reject=%u skipped=%u err=%u last_ms=%u "
-           "last_score=%u feat_sent=%u feat_skipped=%u",
+           "last_score=%u feat_sent=%u feat_skipped=%u infer_stack_hwm_words=%u",
            prefix, mode_name(this->mode()), (unsigned) this->threshold(), this->status_, this->selftest_text_,
            (unsigned) this->arena_used_, (unsigned) this->arena_actual_, (unsigned) this->setup_free_psram_,
            (unsigned) this->setup_free_internal_, (unsigned) frames_total, (unsigned) infers_total,
            (unsigned) this->n_detections_.load(), (unsigned) this->n_passed_.load(), (unsigned) this->n_rejected_.load(),
            (unsigned) this->n_shadow_reject_.load(), (unsigned) this->n_skipped_.load(),
            (unsigned) this->n_errors_.load(), (unsigned) this->last_infer_ms_.load(), (unsigned) this->last_score_.load(),
-           (unsigned) this->n_feat_sent_.load(), (unsigned) this->n_feat_skipped_.load());
+           (unsigned) this->n_feat_sent_.load(), (unsigned) this->n_feat_skipped_.load(),
+           (unsigned) this->stack_hwm_words_.load(std::memory_order_relaxed));
 }
 
 void Stage2Runner::loop(uint32_t frames_total, uint32_t infers_total) {
