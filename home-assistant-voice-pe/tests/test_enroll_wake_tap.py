@@ -16,7 +16,7 @@ class EnrollWakeTap(unittest.TestCase):
         self.assertIn("void enter_enrollment_(bool wake_tap);", self.h)
 
     def test_start_frame_parses_capture_and_acks(self):
-        self.assertIn('this->enter_enrollment_(wake_tap);', self.cpp)
+        self.assertIn('this->enter_enrollment_(enroll_wake_tap);', self.cpp)
         self.assertIn('\\"type\\":\\"enroll_capture\\"', self.cpp)
         self.assertIn("pdMS_TO_TICKS(50)", self.cpp)
 

@@ -8,9 +8,10 @@ ROOT = Path(__file__).resolve().parents[1]
 class DropInHandoff(unittest.TestCase):
     def test_assistant_queues_validated_instruction_and_waits_for_release(self):
         source = (ROOT / "esphome/components/voice_assistant_websocket/voice_assistant_websocket.cpp").read_text()
-        handler = source.split('std::strcmp(type, "drop_in")', 1)[1].split('#else', 1)[0]
-        self.assertIn('room.size() <= 64', handler)
-        self.assertIn('request_id.size() <= 128', handler)
+        parse = source.split('void VoiceAssistantWebSocket::handle_text_message_', 1)[1]
+        self.assertIn('dropin_room.size() <= 64', parse)
+        self.assertIn('dropin_request.size() <= 128', parse)
+        handler = parse.split('case Type::MSG_DROP_IN:', 1)[1].split('#else', 1)[0]
         self.assertIn('pending_dropin_deadline_ms_ = millis() + 5000', handler)
         self.assertIn('this->stop();', handler)
         loop = source.split('void VoiceAssistantWebSocket::loop()', 1)[1].split('// Handle pending reboot', 1)[0]
