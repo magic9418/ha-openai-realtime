@@ -4,7 +4,7 @@
   "source_path": "../../satellite1/esphome/components",
   "components": {
     "fusb302b": "23056b5578a2c9a9947cc1ea5352a1c6f3b513dce38d85c306d9483da7bfc5ac",
-    "neo_intercom": "f6cf01cc90f86c174903ec739a1d99a04ef8964d261dbb6c775451d237b1132c",
+    "neo_intercom": "e26194f8bf440e8172070d4017ea2c288da4b23002f52a7aa6f539a9e98df982",
     "satellite1": "04bcbd65e0b4dbda6d8924792b1c43e84280f09c6d3366f024122e882b27e636",
     "tas2780": "d1d26c748a79c73be84aaa392ba1dca6daf2abdb0359884c9421b8be16316196"
   },
