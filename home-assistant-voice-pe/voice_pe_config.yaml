@@ -34,7 +34,7 @@ substitutions:
   # at /satellite1 so '../../satellite1' resolves (natively it is firmware/voice-pe/home-assistant-voice-pe/../../satellite1);
   # run verify_shared_components.py first. The sibling must be content-identical to the lock.
   # F1a = intermediate consolidated build (NOT FOR FLASH): talkover5 + review fixes + shared components.
-  esp32_fw_version: neo-2026.11.23-office-f1
+  esp32_fw_version: neo-2026.11.24-office-f1b
   neo_intercom_device_id: office-voice-pe
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
@@ -156,10 +156,8 @@ esp32:
       # of corrupting the free list silently (the talkover2 StoreProhibited in tlsf_malloc). Costs a
       # few bytes per allocation; remove once the crash is found.
       #
-      # TODO(F1 soak): TURN OFF after an on-device soak shows > 50 KB internal DRAM free (see the
-      # `[diag]` heap lines). It is a ONE-LINE change: delete this key (or set it to "n"). Matching
-      # switch: `heap_diag: true` on voice_assistant_websocket below. Both stay ON for the first F1 flash.
-      CONFIG_HEAP_POISONING_LIGHT: "y"
+      # F1 soak PASSED (116 KB boot / 89 KB min soak internal DRAM free, no crash). Heap poisoning turned OFF.
+      CONFIG_HEAP_POISONING_LIGHT: "n"
       # talkover5: reclaim internal RAM (idle free was ~13 KB after one session). WiFi static RX buffers
       # are internal RAM, ~1.6 KB each: 16 -> 8 frees ~13 KB. RX BA window kept <= 2x the static count
       # (it was 32). DYNAMIC_RX, TCP window and TX settings are deliberately untouched.
@@ -196,12 +194,11 @@ wifi:
 network:
 
 logger:
-  # F1 soak: DEBUG is DELIBERATE (the on-device soak needs the [diag]/heap and talk-over detail). Drop to INFO
-  # (as Sat1 already is) in the clean-up build once the soak is done.
-  level: DEBUG
+  # F1 soak passed: match Sat1 INFO logging for production.
+  level: INFO
   logs:
     sensor: WARN
-    voice_assistant_websocket: DEBUG
+    voice_assistant_websocket: INFO
 
 api:
   id: api_id
@@ -1444,9 +1441,8 @@ voice_assistant_websocket:
   uplink_gain_factor: 64
   # DEVELOPMENT: report heap stats + integrity check to the server as {"type":"diag",...} frames
   # (start / audio / tick every 2 s / end). Main loop only. See wakeword/builds/2026-11-14/README.md.
-  # TODO(F1 soak): set to false (one line) together with CONFIG_HEAP_POISONING_LIGHT above, once an
-  # on-device soak shows > 50 KB internal DRAM free. Kept ON for the first F1 flash on purpose.
-  heap_diag: true
+  # F1 soak passed (>89 KB internal DRAM free): heap_diag off for production.
+  heap_diag: false
   # talkover4: the persistent uplink sender task's 4 KB stack lives in PSRAM (falls back to internal RAM).
   task_stack_in_psram: true
   # PE-specific (the component source is shared byte-for-byte with Satellite1, see
